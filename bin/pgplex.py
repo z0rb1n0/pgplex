@@ -29,4 +29,4 @@ log_manager.setup_loggers()
 LOGGER.info("%s version %d.%d.%d starting" % (info.APP_TITLE, info.APP_MAJOR, info.APP_MINOR, info.APP_REVISION))
 guc.reload()
 
-
+LOGGER.info("Creating and initializing listeners")
