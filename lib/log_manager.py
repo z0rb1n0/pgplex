@@ -10,7 +10,7 @@ import logging.config
 LOGGER = logging.getLogger(__name__)
 
 
-def setup_loggers():
+def setup_loggers(threshold = "INFO"):
 	logging.config.dictConfig({
 		"version": 1,
 		"disable_existing_loggers": False,
@@ -21,7 +21,7 @@ def setup_loggers():
 		},
 		"handlers": {
 			"default": {
-				"level": "INFO",
+				"level": threshold,
 				"formatter": "standard",
 				"class": "logging.StreamHandler",
 			},
@@ -29,7 +29,7 @@ def setup_loggers():
 		"loggers": {
 			"": {
 				"handlers": [ "default" ],
-				"level": "INFO",
+				"level": threshold,
 				"propagate": True
 			},
 		}

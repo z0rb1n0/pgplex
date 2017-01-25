@@ -9,6 +9,7 @@ import json
 import logging
 import configparser
 import re
+import textwrap
 
 import info
 import args
@@ -31,8 +32,13 @@ LOGGER = logging.getLogger(__name__)
 
 CONFIG_DIR_RELATIVE = "." + info.APP_NAME
 
+# this is the current guc tree, with hierarchy
+current = {}
 
-guc = {}
+# this is flattened out
+gettables = {}
+
+
 
 # Grand Unified Configuration, Postgres style, only with a 1-level directory system to boot
 # 
@@ -43,7 +49,7 @@ guc = {}
 # 1) Expected type (python type. Cast is attempted for validation)
 # 2) Accepted values.
 #		For integers/floats 1-2 member tuple specifying inclusive bonds is expected (upper bound set to the lower not unspecified)
-#    	For string a it can be either a tuple with the set of accepted values or a compiled regular expression
+#    	For string it can be either a tuple with the set of accepted values or a regular expression (just the string, not the compiled object)
 #    Can be None, in which case no validation is performed
 # 3) Default value.
 # 		For settings with arbitrary values it's the actual value (None if not specified).
@@ -79,22 +85,24 @@ DEFINITIONS = {
 
 		"listen_addresses": (str, None, "localhost", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"port": (int, (1, 65535), 5432, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
+
+		"housekeeping_interval": (int, (0, ), 50, "Python is not really great at not missing signals, especially SIGCHLD. We periodically wake up the listener to check for zombies to reap (and eventually do more stuff in the future). This specifes the interval between checks, in milliseconds. 0 or less disables housekeeping entirely (not recommended"),
+
 		"max_connections": (int, (0, ), 3, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS . Note that this applies to incoming connections and does not encroach shared memory"),
 		"max_connections_control_db": (int, (1,), 8, "much like max_connections, but it limits connections to the control_db instead. NOTE: connections to the system db count towards the global max_connections limit"),
 
 		"unix_socket_directories": (str, None, "/tmp", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"unix_socket_group": (str, None, None, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
-		"unix_socket_permissions": (str, None, None, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
+		"unix_socket_permissions": (str, "^[0-7]{4}$", "0600", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 
 		"tcp_keepalives_idle": (int, (0,), 0, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"tcp_keepalives_interval": (int, (0,), 0, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"tcp_keepalives_count": (int, (0,), 0, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 
-
 		"ssl": (bool, None, False, "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
 		"ssl_key_file": (str, None, PGPLEX_SSL_PATH + "/server.key", "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
 		"ssl_ca_file": (str, None, PGPLEX_SSL_PATH + "/ca.crt", "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
-		
+
 		"control_db_name": (str, None, "pgplex_control", """
 			A special database name that can is reserved for connections to the pgplex run-time interface.
 			Connection to this database cause queries to be routed to an internal management engine to
@@ -103,7 +111,7 @@ DEFINITIONS = {
 
 	},
 	"multiplexer": {
-		"channel_timeout": (int, (-1,), 0, """
+		"channel_timeout": (int, (-1,), -1, """
 			Transaction poolers continuously re-assign database sessions to diffent clients, however SQL sessins are stateful,
 			which requires some degree of persistent correlation between the incoming connection and the backend
 			(eg: a backend cannot safely be re-assigned to another client as long as it is in transaction).
@@ -133,7 +141,8 @@ DEFINITIONS = {
 }
 
 
-
+# we don't like to reparse our regexes, so we just cache them in here
+_cached_regexes = {}
 
 def get_defaults():
 	out_guc = {}
@@ -162,7 +171,6 @@ def get_defaults():
 				else:
 					out_guc[section_name][setting_name] = None
 	return out_guc
-
 
 def get_file(cfg_file):
 	"""
@@ -312,21 +320,89 @@ def get_all():
 							))
 
 				# multiple choices or regular expressions...
-				if (target_type is str):
+				if ((target_type is str) and (DEFINITIONS[guc_section][guc_key][1] is not None)):
+					err_str = ""
 					str_validator = DEFINITIONS[guc_section][guc_key][1]
 					if (isinstance(str_validator, (tuple, list))):
 						if (final_val not in (str_validator)):
-							raise ValueError("Invalid value for `%s.%s`: `%s` (from %s) (accepted values are `%s`)" % (
-								guc_section, guc_key, final_val, guc_f.__name__, "`, `".join(str_validator)
-							))
-					
+							err_str	= "accepted values are `%s`" % "`, `".join(str_validator)
+					else:
+						# regular expression cache lookup
+						if (not (str_validator in _cached_regexes)):
+							the_re = re.compile(str_validator)
+							_cached_regexes[str_validator] = the_re
+						else:
+							the_re = _cached_regexes[str_validator]
+
+						if (not the_re.search(final_val)):
+							err_str	= "must match regular expression `%s`" % str_validator
+
+					if (len(err_str)):
+						raise ValueError("Invalid value for `%s.%s`: `%s` (from %s) (%s)" % (
+							guc_section, guc_key, final_val, guc_f.__name__, err_str
+						))
+						return None
+				
 
 				out_guc[guc_section][guc_key] = final_val
 	
 	return out_guc
 
+
 def reload():
 	""" Simply scans the configuration and stores in the would-be public member """
+	global current
+	global gettables
 	LOGGER.info("[Re]Loading configuration...")
-	guc = get_all()
+	current = get_all()
+	# the next loop could be avoided, but hopefully we don't reload the configuration THAT often
+	for (section_key, section_items) in current.items():
+		for (item_key, item_val) in section_items.items():
+			gettables[item_key] = item_val
+
+
+
+def get(setting):
+	"""
+		Retrieves a value from the flattened out configuration.
+		Fails hard
+		
+		Args:
+			setting:		(str)The setting name
+	"""
+	global gettables
+	try:
+		return gettables[setting]
+	except Exception as e_setting:
+		raise KeyError("GUC Setting `%s` does not exist" % (setting,)) from e_setting
+
+
+def generate_cfg_file():
+	"""
+		Outputs a commented-out configuration file template based on the default values
+	"""
+	out_buf = ""
+
+	sections_order = [ "global", "listener" ]
+	# index method does not like misses
+	sections_order += filter(lambda k : (k not in sections_order), DEFINITIONS.keys())
+
+	for section_key in sorted(DEFINITIONS.keys(), key = sections_order.index):
+		section_members = DEFINITIONS[section_key]
+		
+		out_buf += ("\n\n" if (len(out_buf)) else "") + ("[%s]\n\n" % (section_key,))
+		for (setting_key, setting_config) in section_members.items():
+			(setting_type, setting_vaild, setting_default, setting_desc) = setting_config
+
+			# if there's a description we create a squid-like mini-guide
+			if (len(setting_desc.strip())):
+				out_buf += "# " + ("\n# ".join(textwrap.wrap(re.sub("\\s+", " ", (setting_key + ": " + setting_desc.strip())), 80))) + "\n"
+
+			out_buf += "#%s = %s\n\n" % (
+				setting_key,
+				setting_default
+			)
+				
+
+	return out_buf
 

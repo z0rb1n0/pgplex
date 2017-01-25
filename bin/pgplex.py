@@ -23,10 +23,18 @@ LOGGER = logging.getLogger(__name__)
 
 
 
-log_manager.setup_loggers()
+log_manager.setup_loggers("DEBUG")
 
 
 LOGGER.info("%s version %d.%d.%d starting" % (info.APP_TITLE, info.APP_MAJOR, info.APP_MINOR, info.APP_REVISION))
 guc.reload()
-
 LOGGER.info("Creating and initializing listeners")
+
+
+# main listener loop begins
+l_main = inbound.Listener(addresses = tuple(map(lambda a : a.strip(), guc.get("listen_addresses").split(","))), setup_on_init = 1)
+
+
+while True:
+	nc = l_main.get_next_client()
+	print(nc)
