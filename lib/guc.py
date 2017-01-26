@@ -26,6 +26,10 @@ PGPLEX_SSL_PATH = PGPLEX_CONFIG_PATH + "/ssl"
 SETTING_NAME_RE = re.compile(pattern = "^[0-9a-z_]{1,64}$")
 
 
+# for settings supporting multiple entries, this is what we use to break them apart
+SETTING_ARRAY_SEPARATOR = ","
+
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,14 +50,18 @@ gettables = {}
 # 
 # Each level key here contains an 1-to-3, tuple (2nd 3rd and 4th member are optional)
 # Tuple members:
-# 1) Expected type (python type. Cast is attempted for validation)
+# 1) Expected type (python type. Cast is attempted for validation. tuples/lists are accepted
+# 	 and cause the setting to be broken into a tuple separated by SETTING_ARRAY_SEPARATOR.
+#    Individual tuple entries are trimmed (validation is performed against the trimmed values)
 # 2) Accepted values.
 #		For integers/floats 1-2 member tuple specifying inclusive bonds is expected (upper bound set to the lower not unspecified)
-#    	For string it can be either a tuple with the set of accepted values or a regular expression (just the string, not the compiled object)
+#    	For strings it can be either a tuple with the set of accepted values or a regular expression (just the string, not the compiled object)
+#       For iterable types, each member is considered a string and is validated according to the same rules
 #    Can be None, in which case no validation is performed
 # 3) Default value.
 # 		For settings with arbitrary values it's the actual value (None if not specified).
 # 		For multiple-choice settings it is the index in the options list
+#       If the type is tuple and default is None, yields an empty tuple
 # 4) Description of the setting. Defaults to None
 #
 # WARNING!!!!: Although the configuration is divided in sections,
@@ -69,7 +77,8 @@ gettables = {}
 #   "accept_tips": (bool, None, True, "U.S. are weird"),
 #   "shot_ratio": (float, (0.2, 0.4), 0.3, "Coffee/Total fraction"),
 #   "greeting_line": (str, ( "Hello, what would you like today?", "What's your poison?", "Hello, how can I help you?" ], 1, "What [s]he says"),
-#   "home_page": (str, re.compile("http://[.]*"), None, "Where [s]he's at")
+#   "home_page": (str, "^http://[.]*", None, "Where [s]he's at"),
+#   "phobias": (tuple, "^(spiders|mice|snakes)$", None, "What the guy/gal does not tolerate")
 #  }
 # }
 #
@@ -83,7 +92,7 @@ DEFINITIONS = {
 	},
 	"listener": {
 
-		"listen_addresses": (str, None, "localhost", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
+		"listen_addresses": (tuple, None, "localhost", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"port": (int, (1, 65535), 5432, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 
 		"housekeeping_interval": (int, (0, ), 50, "Python is not really great at not missing signals, especially SIGCHLD. We periodically wake up the listener to check for zombies to reap (and eventually do more stuff in the future). This specifes the interval between checks, in milliseconds. 0 or less disables housekeeping entirely (not recommended"),
@@ -91,7 +100,7 @@ DEFINITIONS = {
 		"max_connections": (int, (0, ), 3, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS . Note that this applies to incoming connections and does not encroach shared memory"),
 		"max_connections_control_db": (int, (1,), 8, "much like max_connections, but it limits connections to the control_db instead. NOTE: connections to the system db count towards the global max_connections limit"),
 
-		"unix_socket_directories": (str, None, "/tmp", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
+		"unix_socket_directories": (tuple, None, "/tmp", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"unix_socket_group": (str, None, None, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"unix_socket_permissions": (str, "^[0-7]{4}$", "0600", "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 
@@ -144,6 +153,19 @@ DEFINITIONS = {
 # we don't like to reparse our regexes, so we just cache them in here
 _cached_regexes = {}
 
+
+def split_multi_setting(setting):
+	"""
+		Convenience function that handles all cases for configuration strings that need
+		to be cast to tuples. Returns the empty tuple on None input or strings that can be
+		collapsed to nothing (such as series of white spaces)
+		
+		Args:
+			setting:		(str)The string requiring conversion
+	"""
+	return tuple(filter(str.strip, map(lambda s : s.strip(), (setting if (setting is not None) else "").split(SETTING_ARRAY_SEPARATOR))))
+
+
 def get_defaults():
 	out_guc = {}
 	known_settings = []
@@ -164,10 +186,15 @@ def get_defaults():
 			if ((setting_def[0] is str) and isinstance(setting_def[1], (tuple, list))):
 				# we pick the member in the multiple options
 				out_guc[section_name][setting_name] = setting_def[0](setting_def[1][setting_def[2]])
+			# they're also handled differently if they're tuples
 			else:
-				# only None stays unconverted
+				# only None stays unconverted. Note that we break the setting into a tuple
+				# if it's a multiple entry setting
 				if (setting_def[2] is not None):
-					out_guc[section_name][setting_name] = setting_def[0](setting_def[2])
+					if (setting_def[0] in (tuple, list)):
+						out_guc[section_name][setting_name] = split_multi_setting(setting_def[2])
+					else:
+						out_guc[section_name][setting_name] = setting_def[0](setting_def[2])
 				else:
 					out_guc[section_name][setting_name] = None
 	return out_guc
@@ -209,7 +236,11 @@ def get_file(cfg_file):
 								sec_name, key_name, cfg_file, cfg[sec_name][key_name], e_bool.__class__.__name__, e_bool
 							))
 					else:
-						out_guc[sec_name][key_name] = cfg[sec_name][key_name]
+						# again, we split the setting if it's a tuple
+						if (DEFINITIONS[sec_name][key_name][0] in (tuple, list)):
+							out_guc[sec_name][key_name] = split_multi_setting(cfg[sec_name][key_name])
+						else:
+							out_guc[sec_name][key_name] = cfg[sec_name][key_name]
 				else:
 					LOGGER.warning("Unknown configuration option `%s.%s` in `%s`" % (sec_name, key_name, cfg_file))
 		else:
@@ -245,7 +276,11 @@ def get_cmdline(arg_parser):
 		out_guc[sec_name] = {}
 		for key_name in sec_keys:
 			if ((key_name in arg_parser.__dict__) and (arg_parser.__dict__[key_name] is not None)):
-				out_guc[sec_name][key_name] = arg_parser.__dict__[key_name]
+				# third time, we split the argument into a tuple if needed
+				if (DEFINITIONS[sec_name][key_name][0] in (tuple, list)):
+					out_guc[sec_name][key_name] = split_multi_setting(arg_parser.__dict__[key_name])
+				else:
+					out_guc[sec_name][key_name] = arg_parser.__dict__[key_name]
 	return out_guc
 
 
@@ -319,14 +354,14 @@ def get_all():
 								((num_format % (bond_u,)) if (bond_u is not None) else "+infinity")
 							))
 
+
+
 				# multiple choices or regular expressions...
-				if ((target_type is str) and (DEFINITIONS[guc_section][guc_key][1] is not None)):
-					err_str = ""
+				if ((target_type in (str, tuple, list)) and (DEFINITIONS[guc_section][guc_key][1] is not None)):
+
 					str_validator = DEFINITIONS[guc_section][guc_key][1]
-					if (isinstance(str_validator, (tuple, list))):
-						if (final_val not in (str_validator)):
-							err_str	= "accepted values are `%s`" % "`, `".join(str_validator)
-					else:
+
+					if (isinstance(str_validator, str)):
 						# regular expression cache lookup
 						if (not (str_validator in _cached_regexes)):
 							the_re = re.compile(str_validator)
@@ -334,14 +369,27 @@ def get_all():
 						else:
 							the_re = _cached_regexes[str_validator]
 
-						if (not the_re.search(final_val)):
-							err_str	= "must match regular expression `%s`" % str_validator
+					# we treat ANY string we validate like it was a tuple
+					for fv_member in (final_val if (isinstance(final_val, (tuple, list))) else (final_val,)):
+						err_str = ""
 
-					if (len(err_str)):
-						raise ValueError("Invalid value for `%s.%s`: `%s` (from %s) (%s)" % (
-							guc_section, guc_key, final_val, guc_f.__name__, err_str
-						))
-						return None
+						if (isinstance(str_validator, (tuple, list))):
+							if (fv_member not in (str_validator)):
+								err_str	= "accepted values are `%s`" % "`, `".join(str_validator)
+						else:
+							if (not the_re.search(fv_member)):
+								err_str	= "must match regular expression `%s`" % str_validator
+
+						if (len(err_str)):
+							raise ValueError("Invalid value for%s `%s.%s`: `%s` (from %s) (%s)" % (
+								("" if (target_type is str) else " member of"),
+								guc_section,
+								guc_key,
+								fv_member,
+								guc_f.__name__,
+								err_str
+							))
+							return None
 				
 
 				out_guc[guc_section][guc_key] = final_val
