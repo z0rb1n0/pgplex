@@ -28,8 +28,6 @@ log_manager.setup_loggers("DEBUG")
 
 LOGGER.info("%s version %d.%d.%d starting" % (info.APP_TITLE, info.APP_MAJOR, info.APP_MINOR, info.APP_REVISION))
 guc.reload()
-import pprint
-
 LOGGER.info("Creating and initializing listeners")
 
 
@@ -40,6 +38,7 @@ l_main = inbound.Listener(
 )
 
 
-while True:
-	nc = l_main.get_next_downstream()
-	print(nc)
+nc = ()
+while (isinstance(nc, (tuple, list))):
+	nc = l_main.get_next_client()
+	#print(type(nc))

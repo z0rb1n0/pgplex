@@ -7,6 +7,10 @@ import guc
 import os
 import time
 
+
+from ipc_streams import generalize_peer_string
+import pg_streams
+
 LOGGER = logging.getLogger(__name__)
 
 UNIX_SOCKET_TEMPLATE = "{directory}/.s.PGSQL.{port}"
@@ -14,71 +18,12 @@ UNIX_SOCKET_TEMPLATE = "{directory}/.s.PGSQL.{port}"
 class SocketException(Exception):
 	"""	Generic socket error """
 	pass
+class ListenerException(Exception):
+	"""	Generic socket error """
+	pass
 class DNSException(Exception):
 	"""	Generic DNS error"""
 	pass
-
-
-
-def generalize_peer_string(peer_str):
-	"""
-		Different address families have different structures.
-		This function accepts them all and tries to come up with a reasonable
-		string representation
-		
-		Args:
-			address, as the socket library handles it (could be a 2-tuple, string, w/e)
-			
-		Return:
-			a string, typically an RFC compliant string representation of an address
-	"""
-	if (isinstance(peer_str, (str, bytes))):
-		# empty AF_UNIX peer addresses are better represented as a generic "[local]" string
-		return str(peer_str) if len(peer_str) else "[local]"
-	else:
-		# wrap IPV6 retardedness in square brackets
-		is_ipv6 = (not ("." in peer_str[0]))
-		return "%s%s%s:%d" % (
-			("[" if (is_ipv6) else ""),
-			peer_str[0],
-			("]" if (is_ipv6) else ""),
-			peer_str[1]
-		)
-
-
-class DownStream(object):
-	"""
-		Handler of the process + connection talking to the actual frontend.
-	"""
-	def __init__(
-		self,
-		ds_sock
-	):
-		"""
-			The constructor only ensures that the socket is a socket
-		"""
-		if ((not isinstance(ds_sock, (socket.socket,))) or (ds_sock.fileno() < 0)):
-			raise SocketException("Invalid/unconnected socket")
-
-
-		# the actual data stream
-		self.stream = ds_sock
-
-
-		print("Hello, I'm " + self.local_peer + ", serving " + self.remote_peer)
-		while True:
-			ds_sock.send(ds_sock.recv(512))
-
-	@property
-	def local_peer(self):
-		""" Convenience property. Returns a string representation """
-		return generalize_peer_string(self.stream.getsockname())
-
-	@property
-	def remote_peer(self):
-		""" Convenience property. Returns a string representation """
-		return generalize_peer_string(self.stream.getpeername())
-
 
 
 class Listener(object):
@@ -126,11 +71,14 @@ class Listener(object):
 
 
 		# socket objects that are meant to listen. Indexed by [address_family][packed bind address/path] to easily identify what's left to clean up
-		self.sockets = {}
-		
+		self.socket_objects = {}
+		# this is the same list, just flattened (single level, no indication of address family) and indexed by file descriptor number
+		# Useful for quick select() and such
+		self.socket_fds = {}
+
 		
 		# list of the client-facing children, indexed by PID
-		self.downstreams = {}
+		self.clients = {}
 
 
 		if (start_on_init):
@@ -202,20 +150,21 @@ class Listener(object):
 					LOGGER.debug("`%s` %s to `%s`" % (
 						new_address,
 						"canonicalized" if (a_type == socket.AF_UNIX) else "resolved",
-						r_addr
+						(r_addr if (a_type == socket.AF_UNIX) else (socket.inet_ntop(a_type, r_addr)))
 					))
 
+	def __del__(self):
+		self.stop()
 
 	# we do what we can to shut down all the already bound sockets
 	def stop(self):
 		"""
 			Takes down all the listeners sockets.
 		"""
-		for (af, bound_sockets) in self.sockets.items():
-			for (raw_addr, bound_socket) in bound_sockets.items():
-				bound_socket.close()
-				
-		self.sockets = {}
+		for bound_socket in self.socket_fds.values():
+			bound_socket.close()
+		self.socket_fds = {}
+		self.socket_objects = {}
 
 	def start(self, addresses = ()):
 		"""
@@ -258,9 +207,10 @@ class Listener(object):
 				ns = socket.socket(family = af, type = socket.SOCK_STREAM)
 				ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-				if (not (af in self.sockets)):
-					self.sockets[af] = {}
-				self.sockets[af][raw_addr] = ns
+				if (not (af in self.socket_objects)):
+					self.socket_objects[af] = {}
+				self.socket_objects[af][raw_addr] = ns
+				self.socket_fds[ns.fileno()] = ns
 
 				# unfortunately some gymnastics are needed to check for collisions with
 				# existing unix sockets
@@ -270,7 +220,7 @@ class Listener(object):
 						ts = socket.socket(family = socket.AF_UNIX, type = socket.SOCK_STREAM)
 						try:
 							ts.connect(bind_addr)
-							ts.shutodwn(socket.SHUT_RD | socket.SHUT_WR)
+							ts.shutdown(socket.SHUT_RD | socket.SHUT_WR)
 							ts.close()
 							del(ts)
 						except ConnectionRefusedError as e_cnn:
@@ -280,7 +230,7 @@ class Listener(object):
 				try:
 					
 
-					self.sockets[af][raw_addr].bind(bind_addr)
+					self.socket_objects[af][raw_addr].bind(bind_addr)
 					# add socket to dictionary
 					
 					LOGGER.debug("Bound new socket to `%s`" % (bind_addr_str,))
@@ -289,73 +239,79 @@ class Listener(object):
 					raise SocketException("Could not bind socket to address `%s`" % (bind_addr_str,)) from e_bind
 
 				try:
-					self.sockets[af][raw_addr].listen()
+					self.socket_objects[af][raw_addr].listen()
 					LOGGER.debug("Socket bound to `%s` is now listening" % (bind_addr_str,))
 				except Exception as e_listen:
 					self.stop()
 					raise SocketException("Could listen on socket bound to `%s`" % (bind_addr_str,)) from e_listen
 
-	def get_next_downstream(self, housekeeping_interval = None):
+
+	def reap_children(self):
 		"""
-			select()s over the listener's sockets and yields a Client
-			object, representing a freshly established connection
+			This is both a signal handler and a workaround for pythons
+			habit of missing SIGCHLD. We just keep looping until there are no
+			more zombies
+			
+			
+			Returns a list of pids that were reaped
 		"""
+		
+		
+		# We should be using waitpid() with WNOHANG, but apparently, unlike what
+		# the docs say, it makes no difference as a python exception is raised
+		# anyway
+		reaped = (-1, 0)
+
+		so_far = []
+		while (reaped[0] != 0):
+			try:
+				reaped = os.wait()
+			except ChildProcessError as e_nochild:
+				# we leave the loop
+				reaped = (0, 0)
+
+			if (reaped[0] > 0):
+				LOGGER.info("Client session with PID %d(client: %s) ended" % (
+					reaped[0], generalize_peer_string(self.clients[reaped[0]])
+				))
+				so_far.append(self.clients[reaped[0]])
+				del(self.clients[reaped[0]])
+
+		return so_far
+
+		
+
+	def get_next_client(self, housekeeping_interval = None):
+		"""
+			select()s over the listener's socket until a connection comes in
+			and yields a DownStreamSession object in the client,
+			the remote peer in the parent, as in socket.accept()[1]
+		"""
+		
+		if (not len(self.socket_fds)):
+			raise ListenerException("No sockets are bound")
+			return None
+		
 		real_hki = housekeeping_interval if (housekeeping_interval is not None) else guc.get("housekeeping_interval")
 		LOGGER.info("Waiting for clients. Housekeeping interval is %dms" % (real_hki))
 
-		# unfortunately we have to build a list with all the sockets
-		l_sockets = []
-		for (l_af, l_socks) in self.sockets.items():
-			for s_obj in l_socks.values():
-				l_sockets.append(s_obj)
+		bound_sockets = self.socket_fds.values()
+		readable = ()
+		while (not len(readable)):
+			(readable, writable, events) = select.select(bound_sockets, (), (), (float(real_hki) / 1000.0) if (real_hki > 0) else None)
+			self.reap_children()
 
-		while True:
-			
-			(readable, writable, events) = select.select(l_sockets, (), (), (float(real_hki) / 1000.0) if (real_hki > 0) else None)
-			if (len(readable)):
-				for ready_socket in readable:
-					c_sock = ready_socket.accept()
+		# we only accept a connection at a time
+		c_sock = readable[0].accept()
 
-					local_sock = c_sock[0].getsockname()
-					remote_sock = c_sock[0].getpeername()
-					# again, some conditional string formatting is required due to different socket types
-					connection_vector_str = ""
-					if (isinstance(local_sock, (str, bytes))):
-						# unix
-						local_addr_str = str(local_sock)
-						connection_vector_str += "on "
-					else:
-						# tcp. The source makes sense only here
-						local_addr_str = "[%s]:%d" % (local_sock)
-						remote_addr_str = "[%s]:%d" % (remote_sock)
-						connection_vector_str += "from %s to " % (remote_addr_str,)
-
-
-					connection_vector_str += "%s" % (local_addr_str,)
-					
-					try:
-						n_pid = os.fork()
-					except Exception as e_fork:
-						# need to handle this
-						LOGGER.warning("Could not fork child process (%s)" % (connection_vector_str))
-						c_sock[0].shutdown(socket.SHUT_RD | socket.SHUT_WR)
-						c_sock[0].close()
-						del(c_sock)
-						continue
-
-					if (n_pid > 0):
-						# daddy
-
-						# for now we just store an approximate start time here
-						self.downstreams[n_pid] = time.time
-						LOGGER.debug("New connection %s dispatched to child PID %d" % (connection_vector_str, n_pid))
-
-					elif (n_pid == 0):
-						# kiddo
-						
-						# this will close all the listening sockets
-						self.stop()
-						
-						# echo service
-						ds_h = DownStream(c_sock[0])
-
+		n_pid = os.fork()
+		if (n_pid > 0):
+			# parent. We maintain our table of children and return
+			self.clients[n_pid] = c_sock[1]
+			return(self.clients[n_pid])
+		elif (n_pid == 0):
+			# child. We stop the listener and return the session
+			self.stop()
+			return pg_streams.DownStreamSession(ds_sock = c_sock[0])
+		else:
+			raise Exception("Got a negative PID from python's fork. LOL")
