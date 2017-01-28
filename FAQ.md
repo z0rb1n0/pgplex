@@ -7,4 +7,6 @@ To boot pgplex, unlike postgres itself, does not do much heavy lifting as is mos
 I believe Python and its standard modules (many of them we can/do sidestep to save on overhead) generally offer more than enough optimization tools for whatever edge cases we could encounter, and nothing would stop us from writing a custom module if need be.
 
 On the other hand an highly expressive language allows for a far more maintaniable and therefore bug-free implementation, especially in asmall community
+
+
 ---
