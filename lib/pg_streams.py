@@ -13,7 +13,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 
-DEFAULT_CHUNK_SIZE = 16384
+DEFAULT_BUFFER_SIZE = 16384
 
 
 class PgBackendState(enum.Enum):
@@ -47,23 +47,23 @@ class DownStreamSession(ipc_streams.Stream):
 		# it's here
 		downstream_message = None
 
-		# here we store the remainder of the data
-		downstream_buffer = None
+		# here we store the remainder of the data chunk data after popping a message
+		downstream_inbox = ""
 
 
-		# pool-facing counterpart of upstream message
+		# pool-facing counterpart of upstream_message
 		upstream_message = None
+
+		# pool-facing counterpart of upstream_inbox
+		upstream_inbox = None
 
 
 
 		# downstreams sessions are always inbound
 		super().__init__(ds_sock = ds_sock, outbound = False)
 
-		for in_buf in iter(self.pop_next_chunk, b""):
-			self.connection.send(in_buf)
 
-
-	def pop_next_chunk(self, size = DEFAULT_CHUNK_SIZE, timeout = None):
+	def pop_next_chunk(self, size = DEFAULT_BUFFER_SIZE, timeout = None):
 		"""
 			Waits for either end (the pool or the client) to send some data and
 			returns it
@@ -85,7 +85,6 @@ class DownStreamSession(ipc_streams.Stream):
 			return events[0][0].recv(size)
 		
 		
-		
 
 
 	def pop_next_message(self, timeout = None, forward = False):
@@ -103,3 +102,8 @@ class DownStreamSession(ipc_streams.Stream):
 			to mitigate serialization delay problems and memory blowouts
 		"""
 	
+		for in_buf in iter(self.pop_next_chunk, b""):
+			self.connection.send(in_buf)
+
+		for in_buf in iter(self.pop_next_chunk, b""):
+			self.connection.send(in_buf)

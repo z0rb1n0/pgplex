@@ -1,9 +1,12 @@
+# Project in early develoment. At the moment it is a glorified echo server
+
 # PgPlex
+
 
 
 pgplex is an HA postgresql connection proxy/aggregator/pooler which understand PosgreSQL layer 7 protocol messages and makes connection forwarding decisions based on the inferred session state/settings
 
-## H2 Intended features
+## Intended features
 
 
 * #### PostgreSQL proxy listener
@@ -35,3 +38,6 @@ pgplex is an HA postgresql connection proxy/aggregator/pooler which understand P
  * Since pgplex constantly monitors all configured backends through a dedicated connection, it is acutely aware of the state of each backend node/replication state/connection slots availability and can route connections based on that information.
  * Actual load-aware balancing can be achieved if the "pglpex" schema is installed on the backends, as it presents system metrics through database objects
  * A session can state its read-only/read-write intent through a special connection string option, or later during the session by prefixing its statements with a shebang-like string
+
+
+

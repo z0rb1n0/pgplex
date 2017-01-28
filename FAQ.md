@@ -1,3 +1,10 @@
+### Why did you write this?
+
+It all started after some frustration over the implementation of other pooling/clustering tools. They all did their job well but left out at least ONE important aspect of what we needed, forcing us to layer many of them and have to deal with the complexity/obscurity/overhead drawbacks
+
+
+---
+
 ### Using Python for such a performance critical piece of software? Did you lose your mind?
 
 Nowadays we only use C or other low-level languages for stuff such as fast packet sniffing or the like, and more often that not that is driven by language affinity to te POSIX API as opposed to speed requirements.
