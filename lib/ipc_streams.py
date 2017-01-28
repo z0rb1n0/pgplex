@@ -39,15 +39,15 @@ class StreamSetupError(Exception):
 	pass
 
 
-class Stream(socket.socket):
+class Stream(object):
 	"""
 		Generic handler for connections. It's just an embellisher for a socket,
 		which allows for easier SSL wrapping and the like.
 
 	"""
 	def __init__(self,
-		ds_sock: socket.socket,
-		outbound: bool = None
+		ds_sock,
+		outbound = None
 	):
 		"""
 			The constructor first ensures that the socket is a socket.
@@ -70,13 +70,8 @@ class Stream(socket.socket):
 		self._owner_pid = self.pid
 
 		# the actual data stream
-		self.socket_object = ds_sock
-		
-		# we build dictionary to quickly forward attributes to internal members
-		# (generally the socket)
-		self._proxied_attributes = {}
-		for socket_attr in ("read", "write", "send", "recv"):
-			self._proxied_attributes["socket_addr"] = self.socket_object
+		self.connection = ds_sock
+		print(self.connection)
 		
 
 		# this is kinda tricky, especially in charging the order
@@ -92,12 +87,12 @@ class Stream(socket.socket):
 	@property
 	def local_peer(self):
 		""" Convenience property. Returns a string representation """
-		return generalize_peer_string(self.socket_object.getsockname())
+		return generalize_peer_string(self.connection.getsockname())
 
 	@property
 	def remote_peer(self):
 		""" Convenience property. Returns a string representation """
-		return generalize_peer_string(self.socket_object.getpeername())
+		return generalize_peer_string(self.connection.getpeername())
 
 	@property
 	def pid(self):
@@ -112,29 +107,16 @@ class Stream(socket.socket):
 		"""
 		return self._owner_pid
 
-	@property
-	def fileno(self):
-		""" Convenience property. Just the file descriptor number of the socket """
-		return (self.socket_object.fileno() if self.socket_object else None)
-
-
-	# we now choose which attributes are simply offloaded to some members of this class
-	# (most likely the socket itself)
-	def __getattr__(self, attribute):
-
-		try:
-			return self._proxied_attributes[attribute]
-		except KeyError as ke:
-			raise AttributeError("'%s' object has no attribute '%s'" % (self.__class__.__name, attribute))
-
 
 	def shutdown(self):
 		""" Glorified socket shutdown. Always succeeds as it is also used for cleanup """
-		if (self.socket_object):
-			self.socket_object.shutdown(socket.SHUT_RD | socket.SHUT_WR)
-			self.socket_object.close()
+		# best effort
+		try:
+			self.connection.shutdown(socket.SHUT_RD | socket.SHUT_WR)
+		except:
+			pass
 
-		return True
+		self.connection.close()
 
 	def __del__(self):
 		self.shutdown()

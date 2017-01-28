@@ -4,25 +4,16 @@ import sys
 import logging
 import ipc_streams
 import enum
-#from enum import Enum, auto
+import select
 
+
+import pg_messages
 
 LOGGER = logging.getLogger(__name__)
 
 
-# this is a quick way we use to resolve a message 
-MESSAGE_TYPE_CLASSES = {}
 
-
-class MessageTargets(enum.Enum):
-	"""
-		Possible directions a message type is expected to go (indicates destination).
-		To be used as a bitmask
-	"""
-	Neither = 0 # Placeholder for Initialization
-	Backend = 1
-	Frontend = 2
-	Both = 3
+DEFAULT_CHUNK_SIZE = 16384
 
 
 class PgBackendState(enum.Enum):
@@ -30,84 +21,85 @@ class PgBackendState(enum.Enum):
 		These are possible states a postgres backend,
 		and by extension a pgplex DownStreamSession, can be in.
 		With the exception of states pertaining the initialization sequence,
-		and the "busy" states, the value of the enum key is the message type
-		indicator byte
+		and the "busy" states
 	"""
 	
 	# this happens only at startup
 	WaitingForUnqualifiedMessage = None
-	WaitingForStartup = None
-
-
-class UnqualifiedStreamMessage(object):
-	"""
-		For historical reasons, startup messages in postgres have no qualifier
-		byte. They'll be subclassed directly from this class
-		StartupMessage, SSLRequest, CancelRequest
-	"""
-	
-	# this class member is for validation
-	allowed_targets = MessageTargets.Neither
-	
-	def __init__():
-		
-		# this is the m
-		self.type = None
-		
-		# total lenght of the message, excluding the type qualifier if there
-		# is one
-		self.length = None
-
-
-class StreamMessage(UnqualifiedStreamMessage):
-	"""
-		Base class for all the modern postgres message that have types marker bytes
-		at the beginning (the vast majority).
-		
-		https://www.postgresql.org/docs/current/static/protocol-message-formats.html
-	"""
-	# At module initialization, this class member is meant to be enumerated for all
-	# the subclasses of this class and put into a dictionary for quick type resolution
-	type_qualifier = b"\x00" # this is not valid
-
-
-
-class CommandComplete(StreamMessage):
-	allowed_targets = MessageTargets.Frontend
-	type_qualifier = b"C"
-
-
-# we build the message class resolver now
-for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
-	if ((isinstance(msg_class, type)) and issubclass(msg_class, StreamMessage) and (msg_class is not StreamMessage)):
-	#if (issubclass(thing, StreamMessage)):
-		if (msg_class.type_qualifier == StreamMessage.type_qualifier):
-			raise AttributeError("Class %s is a subclass of StreamMessage but does override its type_qualifier" % (msg_class.__name__))
-		if (len(msg_class.type_qualifier) != 1):
-			raise ValueError("Invalid type_qualifier lenght for class %s" % (msg_class.__name__))
-
-		MESSAGE_TYPE_CLASSES[msg_class.type_qualifier] = msg_class
-
 
 
 class DownStreamSession(ipc_streams.Stream):
 	"""
-		Handler of the process + connection talking to the actual frontend.
+		Handler of the process + connection talking to the actual frontend and
+		to its backend-facing counterpart
 	"""
 	def __init__(self,
-		ds_sock
+		ds_sock,
+		outbound = None
 	):
+
+
+		# upstream connection, if there is any
+		self.backend_stream = None
+
+
+		# if we're currently handling a message that is targeted at the client,
+		# it's here
+		downstream_message = None
+
+		# here we store the remainder of the data
+		downstream_buffer = None
+
+
+		# pool-facing counterpart of upstream message
+		upstream_message = None
+
 
 
 		# downstreams sessions are always inbound
 		super().__init__(ds_sock = ds_sock, outbound = False)
-	
-	
-	def get_next_message(self):
+
+		for in_buf in iter(self.pop_next_chunk, b""):
+			self.connection.send(in_buf)
+
+
+	def pop_next_chunk(self, size = DEFAULT_CHUNK_SIZE, timeout = None):
 		"""
-			Blocks until it managed to buffer the entirety of the next message.
+			Waits for either end (the pool or the client) to send some data and
+			returns it
 
+			Args:
+				suize:		(int)How many bytes to fetch
+				timeout:	(float)How many seconds to wait before returning empty-handed
+
+			Returns a 2-tuple:
+				- a pg_messages.PeerTypes representing where the chunk came from
+				- the chunk data (can obviously be 0)
+		"""
+		readers = [self.connection]
+		if (self.backend_stream is not None):
+			readers.append(self.backend_stream.connection)
+		
+		events = select.select(readers, [], [], timeout)
+		if (len(events[0])):
+			return events[0][0].recv(size)
+		
+		
+		
+
+
+	def pop_next_message(self, timeout = None, forward = False):
+		"""
+			Message collector, forwarder.
 			
+			Blocks until it managed to buffer the entirety of the next message,
+			or the timeout expired.
+			The message may be coming from a pool member (chunks coming from shared memory,
+			based on addresses sent over the synchronisation socket)
 
+			Or from the client socket.
+
+			For larger messages it'd make sense to allow for chunked forwarding in order
+			to mitigate serialization delay problems and memory blowouts
 		"""
 	

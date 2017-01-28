@@ -6,6 +6,7 @@ import select
 import guc
 import os
 import time
+import signal
 
 
 from ipc_streams import generalize_peer_string
@@ -57,6 +58,10 @@ class Listener(object):
 				addresses:		(iterable)Fed as-is to add_bind_targets().
 		"""
 
+		
+		# this is useful to keep trick of the listener following forks
+		self._listener_pid = None
+
 		# The port we will bind to
 		self.bind_port = port
 
@@ -76,9 +81,10 @@ class Listener(object):
 		# Useful for quick select() and such
 		self.socket_fds = {}
 
-		
+
 		# list of the client-facing children, indexed by PID
-		self.clients = {}
+		# each member is a 2 tuple containing the remote peer and the origiating listener socket
+		self.children = {}
 
 
 		if (start_on_init):
@@ -154,17 +160,53 @@ class Listener(object):
 					))
 
 	def __del__(self):
-		self.stop()
+		# we do absolutely nothing unless this is the same process that started it
+		if ((self._listener_pid is not None) and (self._listener_pid == os.getpid())):
+			self.stop()
 
-	# we do what we can to shut down all the already bound sockets
-	def stop(self):
+
+	def shutdow_listeners(self):
 		"""
-			Takes down all the listeners sockets.
+			Method to take down all the listeners,
+			isolated from stop() so that forked processes can call it
 		"""
 		for bound_socket in self.socket_fds.values():
 			bound_socket.close()
 		self.socket_fds = {}
 		self.socket_objects = {}
+
+	# we do what we can to shut down all the already bound sockets
+	def stop(self, kill_children = False):
+		"""
+			Takes down all the listeners sockets. And eventually the offspring
+			
+			Args:
+				kill_children:		(bool)Terminate all the children this listener spawned
+			
+		"""
+		
+		self.shutdow_listeners()
+
+		if (signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL):
+			signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+		# just for good measure
+		self.reap_children()
+
+		# this loop is still required as the children hold a reference to the sockets that spawned them
+		for cli_pid in dict(self.children):
+			if (kill_children):
+				for next_sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+					os.kill(cli_pid, next_sig)
+					# we don't account for hanging processes as there isn't much we can do
+					del(self.children[cli_pid])
+					time.sleep(0.1)
+			else:
+				# clean up that reference
+				self.children[cli_pid][1] = None
+
+		self._listener_pid = None
+
 
 	def start(self, addresses = ()):
 		"""
@@ -178,6 +220,7 @@ class Listener(object):
 				addresses:		(iterable)Passed as-is to add_bind_targets()
 		"""
 		
+		self._listener_pid = os.getpid()
 		self.add_bind_targets(addresses)
 
 		for (af, addresses) in self.bind_addresses.items():
@@ -232,7 +275,7 @@ class Listener(object):
 
 					self.socket_objects[af][raw_addr].bind(bind_addr)
 					# add socket to dictionary
-					
+
 					LOGGER.debug("Bound new socket to `%s`" % (bind_addr_str,))
 				except Exception as e_bind:
 					self.stop()
@@ -244,6 +287,10 @@ class Listener(object):
 				except Exception as e_listen:
 					self.stop()
 					raise SocketException("Could listen on socket bound to `%s`" % (bind_addr_str,)) from e_listen
+
+		# TIS vital!!!
+		signal.signal(signal.SIGCHLD, self.signal_handler)
+
 
 
 	def reap_children(self):
@@ -272,28 +319,45 @@ class Listener(object):
 
 			if (reaped[0] > 0):
 				LOGGER.info("Client session with PID %d(client: %s) ended" % (
-					reaped[0], generalize_peer_string(self.clients[reaped[0]])
+					reaped[0], generalize_peer_string(self.children[reaped[0]][0])
 				))
-				so_far.append(self.clients[reaped[0]])
-				del(self.clients[reaped[0]])
+				so_far.append(self.children[reaped[0]])
+				del(self.children[reaped[0]])
 
 		return so_far
+
+
+
+	def signal_handler(self, sig_num, int_frame):
+		""" We handle all signals through the same handler """
+		if (sig_num == signal.SIGCHLD):
+			self.reap_children()
+
 
 		
 
 	def get_next_client(self, housekeeping_interval = None):
 		"""
-			select()s over the listener's socket until a connection comes in
-			and yields a DownStreamSession object in the client,
-			the remote peer in the parent, as in socket.accept()[1]
+			Repeatedly select()s over the listener's socket until a connection comes in
+
+			Args:
+				housekeeping_interval:		(int)How many milliseconds to select() for in between maintenance loops
+				
+			Return:
+				- In the child thread: a DownStreamSession objects
+				- In the parent: a 2-tuple
+					- The remote peer, socket.accept()[1]
+					- The socket object that accepted this connection
+				
+
+
 		"""
 		
 		if (not len(self.socket_fds)):
 			raise ListenerException("No sockets are bound")
 			return None
-		
+
 		real_hki = housekeeping_interval if (housekeeping_interval is not None) else guc.get("housekeeping_interval")
-		LOGGER.info("Waiting for clients. Housekeeping interval is %dms" % (real_hki))
 
 		bound_sockets = self.socket_fds.values()
 		readable = ()
@@ -303,15 +367,18 @@ class Listener(object):
 
 		# we only accept a connection at a time
 		c_sock = readable[0].accept()
+		
 
 		n_pid = os.fork()
 		if (n_pid > 0):
 			# parent. We maintain our table of children and return
-			self.clients[n_pid] = c_sock[1]
-			return(self.clients[n_pid])
+			self.children[n_pid] = [c_sock[1], readable[0]]
+			return(self.children[n_pid])
 		elif (n_pid == 0):
+			signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 			# child. We stop the listener and return the session
 			self.stop()
+			# if it's a unix socket, this is a little hack...
 			return pg_streams.DownStreamSession(ds_sock = c_sock[0])
 		else:
 			raise Exception("Got a negative PID from python's fork. LOL")

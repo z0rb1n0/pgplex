@@ -10,7 +10,6 @@ if (not (bp in sys.path)):
 del(bp)
 
 import logging
-
 import log_manager
 
 
@@ -39,6 +38,7 @@ l_main = inbound.Listener(
 
 
 nc = ()
+
+LOGGER.info("Waiting for clients")
 while (isinstance(nc, (tuple, list))):
 	nc = l_main.get_next_client()
-	#print(type(nc))
