@@ -1,0 +1,4 @@
+|Question|Answer|
+|:--- |:-------------|
+### Using Python for such a performance critical piece of software? Did you lose your mind?
+Nowadays I only use C or other level languages for stuff such as fast packet header processing or the like, and more often that not that is driven more by language affinity to te unix API than anything. pgplex, unlike postgres itself, does not do much heavy lifting as it's mostly about process/connection bookkeeping; in fact, there are very few tight loops and performance is largely dominated by system calls. We believe Python and its standard modules (which we often sidestep to save on overhead) generally offer more than enough optimization tools for whatever edge cases we could encounter. I believe that the invaluable benefit of using an highly expressive language is  that it allows for a far more maintaniable and therefore bug-free implementation

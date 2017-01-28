@@ -6,8 +6,6 @@ pgplex is an HA postgresql connection proxy/aggregator/pooler which understand P
 ## H2 Intended features
 
 
-### CORE
-
 * #### PostgreSQL proxy listener
  * Present any number of postgres clusters as if they were a single one, even across differen versions of the backend. This is done by allowing for the target cluster identifier to be encoded in the connection string's DB name,  thereby removing the need to provision a large number of addresses in your client facing network
 
@@ -30,12 +28,8 @@ pgplex is an HA postgresql connection proxy/aggregator/pooler which understand P
 * #### Management database to monitor state
  * Much like modern unix-like systems expose the likes of /proc and /sys for a consisten abstrction model of their configuration, pgplex uses a reserved database name to abstract configuration/management. Since there is no actual PostgreSQL parser running there, the only supported commands are the aforementioned shebang notation and SET/RESET/SHOW
 
-
 * #### Backend monitoring-based automatic failover
  *  pgplex reserves a backend superuser connection for each node for monitoring and configuration changes. This allows it to collect information and detect a server failure and trigger a failover. It is recommended to install the "pgplex" instrumentation schema, which allows for SQL-controlled failover, which is much safer than remote commands
-
-
-### EXTRA
 
 * #### Dynamic, resource-based LOAD balancing
  * Since pgplex constantly monitors all configured backends through a dedicated connection, it is acutely aware of the state of each backend node/replication state/connection slots availability and can route connections based on that information.
