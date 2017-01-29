@@ -27,7 +27,7 @@ log_manager.setup_loggers("DEBUG")
 
 LOGGER.info("%s version %d.%d.%d starting" % (info.APP_TITLE, info.APP_MAJOR, info.APP_MINOR, info.APP_REVISION))
 guc.reload()
-LOGGER.info("Creating and initializing listeners")
+LOGGER.info("Creating and initializing listeners")	
 
 
 # main listener loop begins
@@ -42,3 +42,6 @@ nc = ()
 LOGGER.info("Waiting for clients")
 while (isinstance(nc, (tuple, list))):
 	nc = l_main.get_next_client()
+
+
+nc.handle_session()

@@ -161,8 +161,12 @@ class Listener(object):
 
 	def __del__(self):
 		# we do absolutely nothing unless this is the same process that started it
-		if ((self._listener_pid is not None) and (self._listener_pid == os.getpid())):
-			self.stop()
+		try:
+			if ((self._listener_pid is not None) and (self._listener_pid == os.getpid())):
+				self.stop()
+		except:
+			# probably missing modules during python shutdown
+			pass
 
 
 	def shutdow_listeners(self):
@@ -298,8 +302,7 @@ class Listener(object):
 			This is both a signal handler and a workaround for pythons
 			habit of missing SIGCHLD. We just keep looping until there are no
 			more zombies
-			
-			
+		
 			Returns a list of pids that were reaped
 		"""
 		
@@ -318,7 +321,7 @@ class Listener(object):
 				reaped = (0, 0)
 
 			if (reaped[0] > 0):
-				LOGGER.info("Client session with PID %d(client: %s) ended" % (
+				LOGGER.info("Client session %d(client: %s) ended" % (
 					reaped[0], generalize_peer_string(self.children[reaped[0]][0])
 				))
 				so_far.append(self.children[reaped[0]])
@@ -341,15 +344,13 @@ class Listener(object):
 			Repeatedly select()s over the listener's socket until a connection comes in
 
 			Args:
-				housekeeping_interval:		(int)How many milliseconds to select() for in between maintenance loops
+				housekeeping_interval:		(float)How many seconds to select() for in between maintenance loops. Accepts decimals
 				
 			Return:
 				- In the child thread: a DownStreamSession objects
 				- In the parent: a 2-tuple
 					- The remote peer, socket.accept()[1]
 					- The socket object that accepted this connection
-				
-
 
 		"""
 		
@@ -357,17 +358,16 @@ class Listener(object):
 			raise ListenerException("No sockets are bound")
 			return None
 
-		real_hki = housekeeping_interval if (housekeeping_interval is not None) else guc.get("housekeeping_interval")
+		real_hki = housekeeping_interval if (housekeeping_interval is not None) else float(0.001 * guc.get("housekeeping_interval"))
 
 		bound_sockets = self.socket_fds.values()
 		readable = ()
 		while (not len(readable)):
-			(readable, writable, events) = select.select(bound_sockets, (), (), (float(real_hki) / 1000.0) if (real_hki > 0) else None)
+			(readable, writable, events) = select.select(bound_sockets, (), (), real_hki if (real_hki > 0.0) else None)
 			self.reap_children()
 
 		# we only accept a connection at a time
 		c_sock = readable[0].accept()
-		
 
 		n_pid = os.fork()
 		if (n_pid > 0):
@@ -377,8 +377,7 @@ class Listener(object):
 		elif (n_pid == 0):
 			signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 			# child. We stop the listener and return the session
-			self.stop()
-			# if it's a unix socket, this is a little hack...
+			self.shutdow_listeners()
 			return pg_streams.DownStreamSession(ds_sock = c_sock[0])
 		else:
 			raise Exception("Got a negative PID from python's fork. LOL")

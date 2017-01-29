@@ -71,8 +71,7 @@ class Stream(object):
 
 		# the actual data stream
 		self.connection = ds_sock
-		print(self.connection)
-		
+
 
 		# this is kinda tricky, especially in charging the order
 		peers = (self.local_peer, self.remote_peer)
