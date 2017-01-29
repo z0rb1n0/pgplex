@@ -6,7 +6,7 @@
 
 pgplex is an HA postgresql connection proxy/aggregator/pooler which understand PosgreSQL layer 7 protocol messages and makes connection forwarding decisions based on the inferred session state/settings
 
-## Intended features
+## Planned features
 
 
 * #### PostgreSQL proxy listener
