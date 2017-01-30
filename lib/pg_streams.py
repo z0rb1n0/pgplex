@@ -16,24 +16,10 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_BUFFER_SIZE = 16384
 
 
-class BackEndState(enum.Enum):
-	"""
-		These are possible states a postgres backend,
-		and by extension a pgplex DownStreamSession, can be in.
-		With the exception of states pertaining the initialization sequence,
-		and the "busy" states
 
 
-		Each state contains a tuple of the message classes that are accepted in that state.
-		
-		NOTE: subclasses of the specified class are searched for too, which might pose a performance
-		      problem with deep hierarchies of message classes. Might be useful to pre-flatten the
-		      structure during module initialization if that happens
-		
-	"""
 
-	# the following only happen only at startup
-	WaitingForInitialMessage = (pg_messages.InitialMessage,)
+
 
 
 
@@ -57,7 +43,7 @@ class DownStreamSession(ipc_streams.Stream):
 		self.backend_stream = None
 		
 		# state begs the "what next?" question
-		self.state = BackEndState.WaitingForInitialMessage
+		self.state = pg_messages.SessionState.WaitingForInitialMessage
 
 
 		# The dictionary containing the input/output buffers, and other information
@@ -66,8 +52,8 @@ class DownStreamSession(ipc_streams.Stream):
 		# 1: output
 		# 2: stats
 		self.mail_boxes = {
-			pg_messages.PeerTypes.FrontEnd: [ b"", b"", [] ],
-			pg_messages.PeerTypes.BackEnd: [ b"", b"", [] ]
+			pg_messages.PeerType.FrontEnd: [ b"", b"", [] ],
+			pg_messages.PeerType.BackEnd: [ b"", b"", [] ]
 		}
 
 
@@ -91,7 +77,7 @@ class DownStreamSession(ipc_streams.Stream):
 				append_to_inbox:	(bool)Whether or not the received data should be added to the relevant inbox
 
 			Returns a 3 tuple as follows:
-				- a pg_messages.PeerTypes representing where the chunk came from. Can be Neither if the operation timed out
+				- a pg_messages.PeerType representing where the chunk came from. Can be None if the operation timed out
 				- the appended data. None for timeouts or if the read returned no bytes/failed
 
 		"""
@@ -104,16 +90,19 @@ class DownStreamSession(ipc_streams.Stream):
 
 
 			new_buf = events[0][0].recv(size)
+			
+			#LOGGER.debug("Received buffer: %s", new_buf)
 
 			# which socket did we receive the chunk/event on?
-			origin = pg_messages.PeerTypes.FrontEnd if (events[0][0] is readers[0]) else pg_messages.PeerTypes.BackEnd
+			origin = pg_messages.PeerType.FrontEnd if (events[0][0] is readers[0]) else pg_messages.PeerType.BackEnd
 			if (len(new_buf)):
 				self.mail_boxes[origin][0] += new_buf
 
 			return (origin, new_buf if len(new_buf) else None)
 
 		else:
-			return (pg_messages.PeerTypes.Neither, None)
+			# nothing came along
+			return (None, None)
 
 
 
@@ -134,7 +123,7 @@ class DownStreamSession(ipc_streams.Stream):
 
 
 			Returns a 2-tuple:
-				- a pg_messages.PeerTypes representing where the message came from. Can be Neither if the operation timed out
+				- a pg_messages.PeerType representing where the message came from. Can be None if the operation timed out
 				- the message object. None for errors/timeouts
 
 
@@ -166,7 +155,7 @@ class DownStreamSession(ipc_streams.Stream):
 					if (box not in msgs):
 						# Generate an new message
 						# there is ONE special case..
-						if ((box is pg_messages.PeerTypes.FrontEnd) and (self.state is BackEndState.WaitingForInitialMessage)):
+						if ((box is pg_messages.PeerType.FrontEnd) and (self.state is pg_messages.SessionState.WaitingForInitialMessage)):
 							msg_base_class = pg_messages.InitialMessage
 						else:
 							msg_base_class = pg_messages.QualifiedMessage
@@ -189,13 +178,13 @@ class DownStreamSession(ipc_streams.Stream):
 
 					# we return the message if it's complete...
 					if (not msgs[box].missing_bytes):
-						LOGGER.debug("Received message: %s(%d bytes)", msgs[box].__class__.__name__, len(msgs[box].data))
+						LOGGER.debug("Received message from %s: %s", box.name, msgs[box])
 						return (box, msgs[box])
 
 
 			# if we didn't get any complete message, it's time to buffer up more data
 			nm = self.pop_next_chunk(append_to_inbox = True)
-			if ((nm[0] is pg_messages.PeerTypes.Neither) or (nm[1] is None)):
+			if ((nm[0] is None) or (nm[1] is None)):
 				# buffering failed...
 				# it is convenient to have the same message format...
 				return (nm)
@@ -211,9 +200,34 @@ class DownStreamSession(ipc_streams.Stream):
 
 		while (True):
 
-			nm = self.pop_next_message()
-			if ((nm[0] is None) or (nm[1] is None)):
+			(src_peer, msg) = self.pop_next_message()
+			if ((src_peer is None) or (msg is None)):
 				LOGGER.error("Read error")
 				sys.exit(0)
-			print(nm[1])
-			#self.connection.send(str(nm[1]))
+
+
+
+			# time to check if the state is good for this peer type/backend state
+			if ((src_peer in msg.VALID_START_STATES) and (self.state in msg.VALID_START_STATES[src_peer])):
+				pass
+			else:
+				LOGGER.error("Invalid message %s for current %s-facing stream in state %s",
+					msg.__class__.__name__, src_peer.name, self.state.name
+				)
+
+			sys.exit(0)
+
+# 			if (nm[0] is pg_messages.PeerType.FrontEnd):
+# 				self.process_frontend_message(nm[0])
+# 			else:
+# 				raise NotImplementedError("Can't handle messages from the backend yet")
+
+
+# 	def process_frontend_message(self, message):
+
+# 			# state flow resolution to check if the state is correct
+# 			if (self.state in messages[):
+
+
+# 			print(nm[1])
+# 			#self.connection.send(str(nm[1]))

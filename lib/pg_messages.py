@@ -10,28 +10,40 @@ import struct
 LOGGER = logging.getLogger(__name__)
 
 
+"""
+See https://www.postgresql.org/docs/current/static/protocol-message-formats.html
+for postgres protocol documentation
+
+"""
 
 
 
 
-# this is a quick way we use to resolve a message 
-QUALIFIED_MESSAGE_TYPE_SIGNATURE_MAPS = {}
+
+# STATE FLOW MANAGEMENT
+class SessionState(enum.Enum):
+	"""
+		These are possible states a postgres stream can be in,
+		and by extension a pgplex *StreamSession, can be in.
+	"""
+
+	# the following only happen at startup
+	WaitingForInitialMessage = None
 
 
-# recursive dictionary whigh specifies what
-SUPPORTED_PROTOCOL_VERSIONS = {
-	3: (0,)
-}
-
-
-
-class PeerTypes(enum.IntEnum):
+class PeerType(enum.Enum):
 	"""
 		"Places" pgplex talks to. Useful to indicate directionality of a message
+
+		Every member contains a set of the possible SessionState values a particular
+		PeerType-controlled stream can possibly be in.
+		
+		NOTE:	the naming is somewhat counter-intuitive, as FrontEnd-type peers actually
+				mean backend-type sessions and the other way around for BackEnd-type peers.
+				This is because the naming indicates what's on the other side
 	"""
-	Neither = 0 # Placeholder for Initialization
-	BackEnd = 1
-	FrontEnd = 2
+	BackEnd = set(())
+	FrontEnd = set((SessionState.WaitingForInitialMessage,))
 
 
 
@@ -72,11 +84,19 @@ class Message(object):
 	# This attribute specifies the minimum amounts of bytes required to infer
 	# message type and size
 	SIGNATURE_SIZE = None
+	
+	
+	# This is the dictionary of states of a given subclass of message is and
+	# all its subclasses in turn are accepted by backends in (it is a
+	# pg_streams.BackEndState). 
+	# Note that it is indexed by [PeerType] and each member is then the list
+	# example override:
+	# VALID_START_STATES = {
+	# 		PeerType.FrontEnd] = (pg_streams.BackEndState.WaitingForInitialMessage,)
+	VALID_START_STATES = {}
+	
+	
 
-	# base messages go nowhere
-	ALLOWED_RECIPIENTS = PeerTypes.Neither
-	
-	
 
 	def __new__(cls, *args, **kwargs):
 		"""
@@ -261,15 +281,20 @@ class InitialMessage(Message):
 	RESERVED_PROTOCOL_VERSION_PACKED = None
 
 
+	# this can safely be inherited by all startup message types
+	VALID_START_STATES = {
+		PeerType.FrontEnd: (SessionState.WaitingForInitialMessage,)
+	}
 
 
 class StartupMessage(InitialMessage):
-	ALLOWED_RECIPIENTS = PeerTypes.BackEnd
 
 	def __init__(self, start_data):
 
 		self.protocol_major = None
 		self.protocol_minor = None
+		self.options = {}
+
 		super().__init__(start_data)
 
 
@@ -285,11 +310,24 @@ class StartupMessage(InitialMessage):
 		""" Just extracts version information """
 		if (self.length and (not self.missing_bytes)):
 			(self.protocol_major, self.protocol_minor) = struct.unpack("!HH", (self.data[4:6] + self.data[6:8]))
+			
+			# we break the connection string into pieces
+			opt_n = None
+			for cnn_opt_w in self.data[8:-1].split(b"\x00"):
+				if (opt_n is None):
+					opt_n = cnn_opt_w.decode()
+				else:
+					self.options[opt_n] = cnn_opt_w.decode()
+					opt_n = None
+
+
 			return True
+		else:
+			return False
 
 	def info_str(self):
 		if ((self.protocol_major and self.protocol_minor) is not None):
-			return "protocol version: %d.%d" % (self.protocol_major, self.protocol_minor)
+			return "protocol version: %d.%d, options: %s" % (self.protocol_major, self.protocol_minor, str(self.options))
 		else:
 			return "protocol information unknown"
 
@@ -298,12 +336,12 @@ class StartupMessage(InitialMessage):
 		
 
 class CancelRequest(InitialMessage):
-	ALLOWED_RECIPIENTS = PeerTypes.BackEnd
+	ALLOWED_RECIPIENTS = PeerType.BackEnd
 	RESERVED_PROTOCOL_VERSION = (1234, 5678)
 
 
 class SSLRequest(InitialMessage):
-	ALLOWED_RECIPIENTS = PeerTypes.BackEnd
+	ALLOWED_RECIPIENTS = PeerType.BackEnd
 	RESERVED_PROTOCOL_VERSION = (1234, 5679)
 
 
@@ -312,8 +350,6 @@ class QualifiedMessage(Message):
 	"""
 		Base class for all the modern postgres message that have types marker bytes
 		at the beginning (the vast majority).
-		
-		https://www.postgresql.org/docs/current/static/protocol-message-formats.html
 	"""
 	SIGNATURE_SIZE = 5 # see base class
 
@@ -324,8 +360,8 @@ class QualifiedMessage(Message):
 	TYPE_QUALIFIER = b"\x00"
 
 
-class CommandCompleteMessage(Message):
-	ALLOWED_RECIPIENTS = PeerTypes.FrontEnd
+class CommandComplete(Message):
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
 	TYPE_QUALIFIER = b"C"
 
 
