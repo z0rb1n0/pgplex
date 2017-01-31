@@ -10,6 +10,8 @@
 pgplex is an HA postgresql connection proxy/aggregator/pooler which understand PosgreSQL layer 7 protocol messages and makes connection forwarding decisions based on the inferred session state/settings.
 It is designed to use nothing else than the SQL connection to the backends to perform its activities (sometimes going as far as incapacitating a stray primary DB via SQL with a query). No node-to-node SSH required
 
+---
+---
 
 ## Planned features (will add a checklist with completion indicators soon). _It's going to be a long way..._
 
@@ -46,7 +48,7 @@ It is designed to use nothing else than the SQL connection to the backends to pe
 * #### Rate throttling
  * Although it is already possible to limit/throttle backend resource hogging through OS facilities (niceness/ulimit/control groups/jails) all of these limiting capabilities are unaware of database specifics. By virtue of independently handling protocol messages, pgplex should be able to limit queries-per-second/records fetched per second in an user/session/db specific manner (eg: useful for application optimization during development)
 
-
+---
 
 ## Requiring support from server-side extension/procedural languages and superuser access
 
