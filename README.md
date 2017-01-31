@@ -1,13 +1,20 @@
-# Project in early develoment. At the moment it is a glorified echo server
+# Project in early develoment. At the moment it is a glorified postgres protocol echo server
+
+
+
 
 # PgPlex
 
 
 
-pgplex is an HA postgresql connection proxy/aggregator/pooler which understand PosgreSQL layer 7 protocol messages and makes connection forwarding decisions based on the inferred session state/settings
+pgplex is an HA postgresql connection proxy/aggregator/pooler which understand PosgreSQL layer 7 protocol messages and makes connection forwarding decisions based on the inferred session state/settings.
+It is designed to use nothing else than the SQL connection to the backends to perform its activities (sometimes going as far as incapacitating a stray primary DB via SQL with a query). No node-to-node SSH required
 
-## Planned features
 
+## Planned features (will add a checklist with completion indicators soon). _It's going to be a long way..._
+
+
+### Attainable with a vanilla PostgreSQL installation and no superuser access (as of 9.6)
 
 * #### PostgreSQL proxy listener
  * Present any number of postgres clusters as if they were a single one, even across differen versions of the backend. This is done by allowing for the target cluster identifier to be encoded in the connection string's DB name,  thereby removing the need to provision a large number of addresses in your client facing network
@@ -31,13 +38,25 @@ pgplex is an HA postgresql connection proxy/aggregator/pooler which understand P
 * #### Management database to monitor state
  * Much like modern unix-like systems expose the likes of /proc and /sys for a consisten abstrction model of their configuration, pgplex uses a reserved database name to abstract configuration/management. Since there is no actual PostgreSQL parser running there, the only supported commands are the aforementioned shebang notation and SET/RESET/SHOW
 
-* #### Backend monitoring-based automatic failover
- *  pgplex reserves a backend superuser connection for each node for monitoring and configuration changes. This allows it to collect information and detect a server failure and trigger a failover. It is recommended to install the "pgplex" instrumentation schema, which allows for SQL-controlled failover, which is much safer than remote commands
+
+* #### Connections count/state aware load balancing
+ * Since pgplex constantly monitors all configured backends through a dedicated connection, it is acutely aware of session count/state through constant monitoring of pg_stat_activity too. It can therefore make load-balancing decisions based on that information
+ * To facilitate the handling of write-to-one-read-from-many access patterns, a session can state its read-only/read-write intent through a special connection string option, or later during the session by prefixing its statements with a shebang-like string
+
+* #### Rate throttling
+ * Although it is already possible to limit/throttle backend resource hogging through OS facilities (niceness/ulimit/control groups/jails) all of these limiting capabilities are unaware of database specifics. By virtue of independently handling protocol messages, pgplex should be able to limit queries-per-second/records fetched per second in an user/session/db specific manner (eg: useful for application optimization during development)
+
+
+
+## Requiring support from server-side extension/procedural languages and superuser access
+
+* #### Backend monitoring-based automatic promotion + failover
+ *  pgplex reserves a backend superuser connection for each node for monitoring and configuration changes. This allows it to collect information and detect a server failure and trigger a failover by using privileged SQL code to promote the backend. It is recommended to install the "pgplex" instrumentation schema for this
 
 * #### Dynamic, resource-based LOAD balancing
- * Since pgplex constantly monitors all configured backends through a dedicated connection, it is acutely aware of the state of each backend node/replication state/connection slots availability and can route connections based on that information.
- * Actual load-aware balancing can be achieved if the "pglpex" schema is installed on the backends, as it presents system metrics through database objects
- * A session can state its read-only/read-write intent through a special connection string option, or later during the session by prefixing its statements with a shebang-like string
+ * It is possible to use procedural languages/extensions to access OS statistics via SQL (we already have in the past, at least on Linux). The inferred load can be integrated to pg_stat_activity for better load balancing decisions
 
+* #### Propagation of every node's pg_hba.conf ACLs to the proxy
+ * In principle this would be attainable without any superuser privilege/procedural language as pg_hba.conf normally resides in PGDATA and can therefore be read with pg_read_file(), but that is not always the case
 
 
