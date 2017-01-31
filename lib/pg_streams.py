@@ -5,6 +5,7 @@ import logging
 import ipc_streams
 import enum
 import select
+import ssl
 
 
 import guc
@@ -178,7 +179,7 @@ class DownStreamSession(ipc_streams.Stream):
 
 					# we return the message if it's complete...
 					if (not msgs[box].missing_bytes):
-						LOGGER.debug("Received message from %s: %s", box.name, msgs[box])
+						LOGGER.debug("Received message from %s: %s. %d bytes still in inbox", box.name, msgs[box], len(self.mail_boxes[box][0]))
 						return (box, msgs[box])
 
 
@@ -215,7 +216,46 @@ class DownStreamSession(ipc_streams.Stream):
 					msg.__class__.__name__, src_peer.name, self.state.name
 				)
 
-			sys.exit(0)
+
+			if (src_peer is pg_messages.PeerType.FrontEnd):
+				# this recursive class-based lookup may be slow. If we want to accelerate it,
+				# the classes referenced by pg_messages.QUALIFIED_MESSAGE_TYPE_SIGNATURE_MAPS
+				# need to be hierarchically into a dictionary to allow for direct hash-based lookups
+				if (isinstance(msg, pg_messages.SSLRequest)):
+					
+					ssl_enabled = guc.get("ssl")
+
+					if (ssl_enabled):
+						self.connection.send(b"S") # last unencrypted byte
+						self.connection = ssl.wrap_socket(self.connection,
+							keyfile = guc.get("ssl_key_file"),
+							certfile = guc.get("ssl_cert_file"),
+							server_side = True,
+							cert_reqs = ssl.CERT_NONE,
+							ca_certs = guc.get("ssl_ca_file"),
+							do_handshake_on_connect = False,
+							suppress_ragged_eofs = True,
+							ciphers = None
+						)
+						self.connection.do_handshake()
+
+
+						
+					else:
+						self.connection.send(b"N")
+
+					LOGGER.debug("%s SSL initiation request from peer %s" % ("Granted" if (ssl_enabled) else "Denied", self))
+
+
+				auth_request = pg_messages.Authentication()
+				auth_request.mode = pg_messages.AuthenticationMode.MD5Password
+				auth_request.encode()
+				LOGGER.debug("Sending: %s" % auth_request)
+				self.connection.send(bytes(auth_request))
+
+				self.state = pg_messages.SessionState.WaitingForAuthentication
+
+
 
 # 			if (nm[0] is pg_messages.PeerType.FrontEnd):
 # 				self.process_frontend_message(nm[0])

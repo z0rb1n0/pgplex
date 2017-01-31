@@ -55,8 +55,8 @@ class Stream(object):
 			that characterize a connection-base session.
 
 			Args:
-				ds_sock:	(socket.socket)The stream-based socket to build the stream around
-				outbound:	(boolean)This nullable boolean offers an option to specify how the
+				ds_sock:		(socket.socket)The stream-based socket to build the stream around
+				outbound		(boolean)This nullable boolean offers an option to specify how the
 							         connection was initiated, mostly for logging purposes.
 							           None = unspecified, logging will be generic
 							           False = outbound, the object was connect()ed
@@ -71,16 +71,12 @@ class Stream(object):
 
 		# the actual data stream
 		self.connection = ds_sock
-
+		
+		self.is_outbound = outbound
 
 		# this is kinda tricky, especially in charging the order
 		peers = (self.local_peer, self.remote_peer)
-		LOGGER.info("New %sconnection: %s %s-> %s" % (
-			("" if (outbound is None) else (("out" if outbound else "in") + "bound ")),
-			peers[0 if (outbound) else 1],
-			("<" if (outbound is None) else ""),
-			peers[1 if (outbound) else 0],
-		))
+		#LOGGER.info("New %s" % str(self))
 
 
 	@property
@@ -117,6 +113,21 @@ class Stream(object):
 
 		self.connection.close()
 
+	def __str__(self):
+		# this is kinda tricky, especially in charging the order
+		peers = (self.local_peer, self.remote_peer)
+		return("%sstream(%s %s-> %s)" % (
+			("" if (self.is_outbound is None) else (("out" if self.is_outbound else "in") + "bound ")),
+			peers[0 if (self.is_outbound) else 1],
+			("<" if (self.is_outbound is None) else ""),
+			peers[1 if (self.is_outbound) else 0],
+		))
+		
+	def __repr__(self):
+		return "< %s >" % str(self)
+		
 	def __del__(self):
-		self.shutdown()
-
+		try:
+			self.shutdown()
+		except:
+			pass

@@ -5,6 +5,7 @@ import logging
 import ipc_streams
 import enum
 import struct
+import random
 
 
 LOGGER = logging.getLogger(__name__)
@@ -16,6 +17,17 @@ for postgres protocol documentation
 
 """
 
+
+# this is a quick lookup table that resolves message qualifiers into the
+# correct QualifiedMessage class
+MESSAGE_QUALIFIERS_CLASSES = {}
+
+
+class MessageEncodeError(Exception):
+	pass
+	
+class MessageDecodeError(Exception):
+	pass
 
 
 
@@ -29,6 +41,7 @@ class SessionState(enum.Enum):
 
 	# the following only happen at startup
 	WaitingForInitialMessage = None
+	WaitingForAuthentication = None
 
 
 class PeerType(enum.Enum):
@@ -43,7 +56,34 @@ class PeerType(enum.Enum):
 				This is because the naming indicates what's on the other side
 	"""
 	BackEnd = set(())
-	FrontEnd = set((SessionState.WaitingForInitialMessage,))
+	FrontEnd = set((SessionState.WaitingForInitialMessage, SessionState.WaitingForAuthentication))
+	
+
+
+
+class AuthenticationMode(enum.IntEnum):
+	"""
+		Possible values for the Authentication-type messages.
+		They're encoded as-is
+	"""
+	Ok = 0
+	KerberosV5 = 2
+	CleartextPassword = 3
+	MD5Password = 5
+	SCMCredential = 6
+	GSS = 7
+	SSPI = 9
+	GSSContinue = 9
+
+# In order to quickly decode authentication states into enum values,
+# we create a map of authentication states by number,
+# And we index it by the packed value
+AUTH_STATE_BYTES = {}
+
+for auth_state in AuthenticationMode:
+	AUTH_STATE_BYTES[struct.pack("!I", 0 + auth_state)] = auth_state
+
+
 
 
 
@@ -84,6 +124,14 @@ class Message(object):
 	# This attribute specifies the minimum amounts of bytes required to infer
 	# message type and size
 	SIGNATURE_SIZE = None
+
+
+	# whether or not a message type should always call self.encode() when one is changed
+	AUTO_ENCODE = False
+
+
+	# whether or not a message type should always call self.decode() when its buffer change
+	AUTO_DECODE = False
 	
 	
 	# This is the dictionary of states of a given subclass of message is and
@@ -95,7 +143,7 @@ class Message(object):
 	# 		PeerType.FrontEnd] = (pg_streams.BackEndState.WaitingForInitialMessage,)
 	VALID_START_STATES = {}
 	
-	
+
 
 
 	def __new__(cls, *args, **kwargs):
@@ -154,7 +202,7 @@ class Message(object):
 			else:
 				# we use the  first byte for the magical lookup
 				try:
-					out_class = QUALIFIED_MESSAGE_TYPE_SIGNATURE_MAPS[start_data[0]]
+					out_class = MESSAGE_QUALIFIERS_CLASSES[start_data[0]]
 				except KeyError as ub_err:
 					raise ValueError("Unknown message type qualifier: %s" % start_data[0])
 
@@ -206,30 +254,32 @@ class Message(object):
 				# It's a little tricky as we're potentially operating across 2 strings
 				# (the previously buffered data)
 				(self.length,) = struct.unpack("!I", (self.data + newdata[0:(self.SIGNATURE_SIZE - len(self.data))])[(self.SIGNATURE_SIZE - 4):])
-				# old calls:
-				#self.length = int.from_bytes(
-				#	bytes = (self.data + newdata[0:(self.SIGNATURE_SIZE - len(self.data))])[(self.SIGNATURE_SIZE - 4):],
-				#	byteorder = "big",
-				#	signed = False # this is a guess. Can't find docs
-				#)
-				#self.length = struct.unpack("!I", (self.data + newdata[0:(min_len - len(self_buffer))])[len(self.TYPE_QUALIFIER):])[0]
 
 		# time to really append however much data is missing
 		self.data += newdata[0:(self.length - len(self.data))]
 
 
+		if (self.AUTO_DECODE):
+			self.decode()
+
+
 
 	def encode(self):
 		"""
-			Wrapper for the actual subclass-controlled encoder. Note that no check are in place as the hook
-			can have arbitrary rules as to whether or not it is possible to proceed
+			Wrapper for the actual subclass-controlled encoder. Note that no checks are in place as the hook
+			can have arbitrary rules as to whether or not it is possible to proceed.
+
+			
+			encode_hook() is expected to return the PAYLOAD only: type qualifier (if any) and length are prepended by
+			this function, however
+
 		"""
 		if (not hasattr(self, "encode_hook") and callable(self.encode_hook)):
 			raise NotImplementedError("encode() has ben called, but %s does not implement encode_hook()" % (self.__class__.__name__))
-			return None
-		return self.encode_hook()
 
-		
+		payload = self.encode_hook()
+		self.data = (self.TYPE_QUALIFIER if hasattr(self, "TYPE_QUALIFIER") else "") + struct.pack("!I", 4 + len(payload)) + payload
+
 
 	def decode(self):
 		"""
@@ -280,6 +330,7 @@ class InitialMessage(Message):
 	# this is just for speed
 	RESERVED_PROTOCOL_VERSION_PACKED = None
 
+	AUTO_DECODE = True
 
 	# this can safely be inherited by all startup message types
 	VALID_START_STATES = {
@@ -289,7 +340,7 @@ class InitialMessage(Message):
 
 class StartupMessage(InitialMessage):
 
-	def __init__(self, start_data):
+	def __init__(self, start_data = b""):
 
 		self.protocol_major = None
 		self.protocol_minor = None
@@ -332,17 +383,23 @@ class StartupMessage(InitialMessage):
 			return "protocol information unknown"
 
 
-
 		
 
 class CancelRequest(InitialMessage):
 	ALLOWED_RECIPIENTS = PeerType.BackEnd
+	AUTO_DECODE = True
 	RESERVED_PROTOCOL_VERSION = (1234, 5678)
+
 
 
 class SSLRequest(InitialMessage):
 	ALLOWED_RECIPIENTS = PeerType.BackEnd
+	AUTO_DECODE = True
 	RESERVED_PROTOCOL_VERSION = (1234, 5679)
+
+	def decode_hook(self):
+		""" No data here """
+		return b""
 
 
 
@@ -360,9 +417,61 @@ class QualifiedMessage(Message):
 	TYPE_QUALIFIER = b"\x00"
 
 
-class CommandComplete(Message):
+class CommandComplete(QualifiedMessage):
 	ALLOWED_RECIPIENTS = PeerType.FrontEnd
 	TYPE_QUALIFIER = b"C"
+
+
+
+class Authentication(QualifiedMessage):
+	"""
+		Any of AuthenticationKerberosV5, AuthenticationCleartextPassword and so on
+		encode() is called
+	"""
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"R"
+
+	def __init__(self, start_data = b""):
+
+		self.mode = None # one of AuthenticationMode
+		self.salt = None # this only applies to some authentication schemes. It is stored as a 32 bit integer
+		self.gss_sspi_data = None # bynary string containing the GSSAPI/SPI data, if needed
+
+		super().__init__(start_data)
+		
+
+	def encode_hook(self):
+		
+		if (self.mode is None):
+			raise(MessageEncodeError("mode is not set"))
+		
+		if ((self.mode == AuthenticationMode.MD5Password) and (self.salt is None)):
+			# we just generate one
+			self.salt = random.randint(-2147483648, 2147483647)
+
+		if ((self.mode == AuthenticationMode.GSSContinue) and (self.gss_sspi_data is None)):
+			raise(MessageEncodeError("GSSAPI/SPI authentication data is required"))
+
+		
+		out_str = struct.pack("!I", self.mode)
+		
+		if (self.mode == AuthenticationMode.MD5Password):
+			out_str += struct.pack("!i", self.salt)
+		elif (self.mode == AuthenticationMode.GSSContinue):
+			out_str += self.gss_sspi_data
+
+		return out_str
+
+
+	# todo: decode hook for the backend side
+
+
+	def info_str(self):
+		
+		if (self.mode is not None):
+			return "mode: %s" % (self.mode.name,)
+		else:
+			return "Unknown authentication mode"
 
 
 
@@ -374,7 +483,7 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 		if (len(msg_class.TYPE_QUALIFIER) != 1):
 			raise ValueError("Invalid TYPE_QUALIFIER lenght for class %s" % (msg_class.__name__))
 
-		QUALIFIED_MESSAGE_TYPE_SIGNATURE_MAPS[msg_class.TYPE_QUALIFIER] = msg_class
+		MESSAGE_QUALIFIERS_CLASSES[msg_class.TYPE_QUALIFIER] = msg_class
 
 	# also, we pack some attribute to avoid having to do it at "run-time"
 	if ((isinstance(msg_class, type)) and issubclass(msg_class, InitialMessage)):
@@ -382,4 +491,5 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 			msg_class.RESERVED_PROTOCOL_VERSION_PACKED = b"".join(
 				map(lambda v : v.to_bytes(length = 2, byteorder = "big"), msg_class.RESERVED_PROTOCOL_VERSION)
 			)
+
 

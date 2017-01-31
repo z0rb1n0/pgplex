@@ -38,6 +38,15 @@ class Listener(object):
 		NOTE: In order to keep things consistent with the way postgres socket binding
 		works, it is not possible to bind different socket pairs on different
 		ports
+		
+		
+		NOTE2: 	SSL is not instantiated at the listener:
+				one of the design goals is to proxy the SSL certificates from the backends,
+				which would require different certificates to be loaded after startups.
+
+				To avoid reloading the certs at every connection, it is probably possible to
+				implement it as persistent dictionary of contexts,
+				but for now the implementation favors simplicity
 	"""
 	
 
@@ -80,6 +89,9 @@ class Listener(object):
 		# this is the same list, just flattened (single level, no indication of address family) and indexed by file descriptor number
 		# Useful for quick select() and such
 		self.socket_fds = {}
+
+
+		self.ssl_context = None
 
 
 		# list of the client-facing children, indexed by PID
@@ -292,6 +304,8 @@ class Listener(object):
 					self.stop()
 					raise SocketException("Could listen on socket bound to `%s`" % (bind_addr_str,)) from e_listen
 
+
+
 		# TIS vital!!!
 		signal.signal(signal.SIGCHLD, self.signal_handler)
 
@@ -353,7 +367,7 @@ class Listener(object):
 					- The socket object that accepted this connection
 
 		"""
-		
+
 		if (not len(self.socket_fds)):
 			raise ListenerException("No sockets are bound")
 			return None

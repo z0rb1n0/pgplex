@@ -108,9 +108,15 @@ DEFINITIONS = {
 		"tcp_keepalives_interval": (int, (0,), 0, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 		"tcp_keepalives_count": (int, (0,), 0, "postgresql-equivalent, see https://www.postgresql.org/docs/current/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SETTINGS"),
 
+
+		"authentication_timeout": (int, (1, ), 60, "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
+
 		"ssl": (bool, None, False, "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
 		"ssl_key_file": (str, None, PGPLEX_SSL_PATH + "/server.key", "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
 		"ssl_ca_file": (str, None, PGPLEX_SSL_PATH + "/ca.crt", "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
+		"ssl_cert_file": (str, None, PGPLEX_SSL_PATH + "/server.crt", "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
+
+		"ssl_ciphers": (str, None, "HIGH:MEDIUM:+3DES:!aNULL", "postgresql-equivalent, see https://www.postgresql.org/docs/9.6/static/runtime-config-connection.html#RUNTIME-CONFIG-CONNECTION-SECURITY"),
 
 		"control_db_name": (str, None, "pgplex_control", """
 			A special database name that can is reserved for connections to the pgplex run-time interface.
@@ -120,7 +126,7 @@ DEFINITIONS = {
 
 	},
 	"multiplexer": {
-		"channel_timeout": (int, (-1,), -1, """
+		"backend_lease_timeout": (int, (-1,), -1, """
 			Transaction poolers continuously re-assign database sessions to diffent clients, however SQL sessins are stateful,
 			which requires some degree of persistent correlation between the incoming connection and the backend
 			(eg: a backend cannot safely be re-assigned to another client as long as it is in transaction).

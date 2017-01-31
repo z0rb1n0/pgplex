@@ -8,12 +8,14 @@
 
 
 pgplex is an HA postgresql connection proxy/aggregator/pooler which understand PosgreSQL layer 7 protocol messages and makes connection forwarding decisions based on the inferred session state/settings.
-It is designed to use nothing else than the SQL connection to the backends to perform its activities (sometimes going as far as incapacitating a stray primary DB via SQL with a query). No node-to-node SSH required
+
+It is designed to use the SQL connection to the backends as the sole control channel (sometimes going as far as permanently incapacitating a stray primary DB via SQL). No node-to-node SSH required
 
 ---
 ---
 
-## Planned features (will add a checklist with completion indicators soon). _It's going to be a long way..._
+## Planned features (will add a checklist with completion indicators soon).
+_We're probably too ambitious and suck too much, but it's going to be a lot of work anyway so might as well go the extra mile..._
 
 
 ### Attainable with a vanilla PostgreSQL installation and no superuser access (as of 9.6)
@@ -21,7 +23,7 @@ It is designed to use nothing else than the SQL connection to the backends to pe
 * #### PostgreSQL proxy listener
  * Present any number of postgres clusters as if they were a single one, even across differen versions of the backend. This is done by allowing for the target cluster identifier to be encoded in the connection string's DB name,  thereby removing the need to provision a large number of addresses in your client facing network
 
-* #### Quorim-controlled masetr proxy/arbitrator allows a number of pgplex instances to operate in HA.
+* #### Quorim-controlled master proxy/arbitrator allows a number of pgplex instances to operate in HA.
  * A decision has not been made yet about whether or not to we should rely on external tools such as etcd for this
 
 * #### Session state-aware, nondisruptive transaction pooling
@@ -50,7 +52,7 @@ It is designed to use nothing else than the SQL connection to the backends to pe
 
 ---
 
-## Requiring support from server-side extension/procedural languages and superuser access
+## Requiring support from server-side extension/procedural languages and/or superuser access
 
 * #### Backend monitoring-based automatic promotion + failover
  *  pgplex reserves a backend superuser connection for each node for monitoring and configuration changes. This allows it to collect information and detect a server failure and trigger a failover by using privileged SQL code to promote the backend. It is recommended to install the "pgplex" instrumentation schema for this
@@ -58,7 +60,11 @@ It is designed to use nothing else than the SQL connection to the backends to pe
 * #### Dynamic, resource-based LOAD balancing
  * It is possible to use procedural languages/extensions to access OS statistics via SQL (we already have in the past, at least on Linux). The inferred load can be integrated to pg_stat_activity for better load balancing decisions
 
-* #### Propagation of every node's pg_hba.conf ACLs to the proxy
- * In principle this would be attainable without any superuser privilege/procedural language as pg_hba.conf normally resides in PGDATA and can therefore be read with pg_read_file(), but that is not always the case
+* #### md5-based validation on the proxy
+ * Given that the monitoring/administration session can belong to a superuser, there is nothing stopping pgplex from using the backend's pg_authid for validation
 
+* #### Enforcement of backend-mandated pg_hba.conf ACLs to the proxy
+ * This requires pgplex to read the node's own pg_hba.conf. In principle this would be attainable without any superuser privilege/procedural language as pg_hba.conf normally resides in PGDATA and can therefore be read with pg_read_file(), but that is not always the case
 
+* #### Propagation of every node's SSL keys/certificates the proxy
+ * Same rules as the pg_hba.conf propagation apply
