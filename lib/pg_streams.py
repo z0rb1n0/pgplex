@@ -42,7 +42,7 @@ class DownStreamSession(ipc_streams.Stream):
 
 		# upstream connection, if there is any
 		self.backend_stream = None
-		
+
 		# state begs the "what next?" question
 		self.state = pg_messages.SessionState.WaitingForInitialMessage
 
@@ -79,7 +79,9 @@ class DownStreamSession(ipc_streams.Stream):
 
 			Returns a 3 tuple as follows:
 				- a pg_messages.PeerType representing where the chunk came from. Can be None if the operation timed out
-				- the appended data. None for timeouts or if the read returned no bytes/failed
+				- the appended data. None for read errors/EOT
+				
+			Returns None if it times out
 
 		"""
 		readers = [self.connection]
@@ -91,6 +93,7 @@ class DownStreamSession(ipc_streams.Stream):
 
 
 			new_buf = events[0][0].recv(size)
+
 			
 			#LOGGER.debug("Received buffer: %s", new_buf)
 
@@ -103,7 +106,7 @@ class DownStreamSession(ipc_streams.Stream):
 
 		else:
 			# nothing came along
-			return (None, None)
+			return None
 
 
 
@@ -152,17 +155,19 @@ class DownStreamSession(ipc_streams.Stream):
 			for box in self.mail_boxes:
 				consumed = 0
 				inbox_bc = len(self.mail_boxes[box][0])
+				#LOGGER.debug("Buffer contents: %d bytes(%s)" % (inbox_bc, self.mail_boxes[box][0]))
 				if (inbox_bc):
 					if (box not in msgs):
 						# Generate an new message
 						# there is ONE special case..
 						if ((box is pg_messages.PeerType.FrontEnd) and (self.state is pg_messages.SessionState.WaitingForInitialMessage)):
-							msg_base_class = pg_messages.InitialMessage
+							expected_message_class = pg_messages.InitialMessage
 						else:
-							msg_base_class = pg_messages.QualifiedMessage
+							expected_message_class = pg_messages.QualifiedMessage
 
-						if (inbox_bc >= msg_base_class.SIGNATURE_SIZE):
-							msgs[box] = msg_base_class(self.mail_boxes[box][0])
+
+						if (inbox_bc >= expected_message_class.SIGNATURE_SIZE):
+							msgs[box] = expected_message_class(self.mail_boxes[box][0])
 							consumed = len(msgs[box].data)
 					else:
 						# the message already knows how much data it needs,
@@ -172,6 +177,7 @@ class DownStreamSession(ipc_streams.Stream):
 							msgs[box].append(mail_boxes[box][0][0:consumed])
 
 
+					#LOGGER.debug("Bytes consumed: %d" % consumed)
 					# it is now time to remove the consumed data from the buffer and
 					# if this turns into a speed issue, ctypes/bytearrays could help
 					if (consumed):
@@ -179,13 +185,13 @@ class DownStreamSession(ipc_streams.Stream):
 
 					# we return the message if it's complete...
 					if (not msgs[box].missing_bytes):
-						LOGGER.debug("Received message from %s: %s. %d bytes still in inbox", box.name, msgs[box], len(self.mail_boxes[box][0]))
+						LOGGER.debug("Received message from %s: %s. %d bytes left in inbox", box.name, msgs[box], len(self.mail_boxes[box][0]))
 						return (box, msgs[box])
 
 
 			# if we didn't get any complete message, it's time to buffer up more data
-			nm = self.pop_next_chunk(append_to_inbox = True)
-			if ((nm[0] is None) or (nm[1] is None)):
+			nm = self.pop_next_chunk(timeout = timeout, append_to_inbox = True)
+			if ((nm is None) or (nm[1] is None)):
 				# buffering failed...
 				# it is convenient to have the same message format...
 				return (nm)
@@ -199,11 +205,35 @@ class DownStreamSession(ipc_streams.Stream):
 			This function blocks while the whole protocol handling is running
 		"""
 
+		# timeout at first is authentication_timeout
+		pop_timeout = guc.get("authentication_timeout")
+
+
 		while (True):
 
-			(src_peer, msg) = self.pop_next_message()
-			if ((src_peer is None) or (msg is None)):
-				LOGGER.error("Read error")
+			popped = self.pop_next_message(pop_timeout)
+			
+			if (popped is None):
+				src_peer = None
+				if (self.state is pg_messages.SessionState.WaitingForInitialMessage):
+					expected = "Startup message"
+				elif (self.state is (pg_messages.SessionState.WaitingForCredentials)):
+					expected = "Authentication"
+				else:
+					# this sould never happen
+					expected = "Idle"
+
+				LOGGER.error("%s timeout of %.3fs was exceeded", expected, pop_timeout)
+			elif ((popped is not None) and (popped[1] is None)):
+				src_peer = None
+				LOGGER.error("Connection terminated by peer/socket time out")
+			else:
+				(src_peer, msg) = (popped[0], popped[1])
+
+
+			if (src_peer is None):
+				# everything went south
+				self.shutdown()
 				sys.exit(0)
 
 
@@ -215,14 +245,15 @@ class DownStreamSession(ipc_streams.Stream):
 				LOGGER.error("Invalid message %s for current %s-facing stream in state %s",
 					msg.__class__.__name__, src_peer.name, self.state.name
 				)
-
+				self.shutdown()
+				sys.exit(0)
 
 			if (src_peer is pg_messages.PeerType.FrontEnd):
 				# this recursive class-based lookup may be slow. If we want to accelerate it,
 				# the classes referenced by pg_messages.QUALIFIED_MESSAGE_TYPE_SIGNATURE_MAPS
 				# need to be hierarchically into a dictionary to allow for direct hash-based lookups
 				if (isinstance(msg, pg_messages.SSLRequest)):
-					
+
 					ssl_enabled = guc.get("ssl")
 
 					if (ssl_enabled):
@@ -235,39 +266,48 @@ class DownStreamSession(ipc_streams.Stream):
 							ca_certs = guc.get("ssl_ca_file"),
 							do_handshake_on_connect = False,
 							suppress_ragged_eofs = True,
-							ciphers = None
+							ciphers = guc.get("ssl_ciphers")
 						)
 						self.connection.do_handshake()
 
-
-						
 					else:
 						self.connection.send(b"N")
 
 					LOGGER.debug("%s SSL initiation request from peer %s" % ("Granted" if (ssl_enabled) else "Denied", self))
 
+				elif (isinstance(msg, pg_messages.StartupMessage)):
 
-				auth_request = pg_messages.Authentication()
-				auth_request.mode = pg_messages.AuthenticationMode.MD5Password
-				auth_request.encode()
-				LOGGER.debug("Sending: %s" % auth_request)
-				self.connection.send(bytes(auth_request))
+					auth_request = pg_messages.Authentication()
+					auth_request.mode = pg_messages.AuthenticationMode.MD5Password
+					auth_request.encode()
+					self.send_message(pg_messages.PeerType.FrontEnd, auth_request)
+					self.state = pg_messages.SessionState.WaitingForCredentials
 
-				self.state = pg_messages.SessionState.WaitingForAuthentication
+				elif (isinstance(msg, pg_messages.Password)):
 
-
-
-# 			if (nm[0] is pg_messages.PeerType.FrontEnd):
-# 				self.process_frontend_message(nm[0])
-# 			else:
-# 				raise NotImplementedError("Can't handle messages from the backend yet")
-
-
-# 	def process_frontend_message(self, message):
-
-# 			# state flow resolution to check if the state is correct
-# 			if (self.state in messages[):
+					auth_ok = pg_messages.Authentication()
+					auth_ok.mode = pg_messages.AuthenticationMode.Ok
+					auth_ok.encode()
+					self.send_message(pg_messages.PeerType.FrontEnd, auth_ok)
+					self.state = pg_messages.SessionState.WaitingForCommand
+					pop_timeout = None
 
 
-# 			print(nm[1])
-# 			#self.connection.send(str(nm[1]))
+	def send_message(self, peer_type, message):
+		"""
+			Simply forwards the message to either side. In the case of the
+			pool, this is likely to be a simple socket wakeup signal
+			Args:
+				peer_type:		(pg_messages.PeerType)Where to
+				message:		(pg_messages.Message)What
+				
+			Returns the amount of bytes sent
+		"""
+		
+		LOGGER.debug("Sending to %s: %s", peer_type.name, message)
+		if (peer_type is pg_messages.PeerType.FrontEnd):
+			return self.connection.send(bytes(message))
+		else:
+			NotImplementedException("Cannot send messages to %s yet" % (peer_type.name))
+
+

@@ -11,6 +11,7 @@ import random
 LOGGER = logging.getLogger(__name__)
 
 
+
 """
 See https://www.postgresql.org/docs/current/static/protocol-message-formats.html
 for postgres protocol documentation
@@ -33,15 +34,16 @@ class MessageDecodeError(Exception):
 
 
 # STATE FLOW MANAGEMENT
-class SessionState(enum.Enum):
+class SessionState(enum.IntEnum):
 	"""
 		These are possible states a postgres stream can be in,
 		and by extension a pgplex *StreamSession, can be in.
 	"""
 
 	# the following only happen at startup
-	WaitingForInitialMessage = None
-	WaitingForAuthentication = None
+	WaitingForInitialMessage = 1
+	WaitingForCredentials = 2
+	WaitingForCommand = 3
 
 
 class PeerType(enum.Enum):
@@ -56,7 +58,7 @@ class PeerType(enum.Enum):
 				This is because the naming indicates what's on the other side
 	"""
 	BackEnd = set(())
-	FrontEnd = set((SessionState.WaitingForInitialMessage, SessionState.WaitingForAuthentication))
+	FrontEnd = set((SessionState.WaitingForInitialMessage, SessionState.WaitingForCredentials))
 	
 
 
@@ -121,6 +123,9 @@ class Message(object):
 	
 
 	"""
+	# this is kinda pointless here but simplifies flow
+	TYPE_QUALIFIER = b""
+	
 	# This attribute specifies the minimum amounts of bytes required to infer
 	# message type and size
 	SIGNATURE_SIZE = None
@@ -130,7 +135,7 @@ class Message(object):
 	AUTO_ENCODE = False
 
 
-	# whether or not a message type should always call self.decode() when its buffer change
+	# whether or not a message type should always call self.decode() when its buffer is full
 	AUTO_DECODE = False
 	
 	
@@ -144,6 +149,11 @@ class Message(object):
 	VALID_START_STATES = {}
 	
 
+	# this dynamically initializes the special propertes of each message type,
+	# (what would be members of a struct in C) without having to override each subclass __init__)
+	# Each key in this dictionary is created as an object attribute, the default value being
+	# the value
+	PAYLOAD_MEMBERS = {}
 
 
 	def __new__(cls, *args, **kwargs):
@@ -188,7 +198,6 @@ class Message(object):
 
 			out_class = None
 			
-			
 			if (cls_name == "InitialMessage"):
 				# there's a very small number of initial messages. No need for a lookup table yet
 				for im_class in cls.__subclasses__():
@@ -201,13 +210,15 @@ class Message(object):
 					out_class = StartupMessage
 			else:
 				# we use the  first byte for the magical lookup
-				try:
-					out_class = MESSAGE_QUALIFIERS_CLASSES[start_data[0]]
-				except KeyError as ub_err:
-					raise ValueError("Unknown message type qualifier: %s" % start_data[0])
+				if (start_data[0] not in MESSAGE_QUALIFIERS_CLASSES):
+					raise ValueError("Unknown message type qualifier: %s" % chr(start_data[0]))
+
+				out_class = MESSAGE_QUALIFIERS_CLASSES[start_data[0]]
 
 
 		out_obj = object.__new__(out_class)
+		
+		
 		return out_obj
 
 
@@ -224,6 +235,12 @@ class Message(object):
 
 		# the data itself
 		self.data = b""
+
+
+		# we initialize the payload-specific attributes.
+		for pm in self.PAYLOAD_MEMBERS:
+			setattr(self, pm, self.PAYLOAD_MEMBERS[pm])
+
 		
 		if (len(start_data)):
 			self.append(start_data)
@@ -234,7 +251,7 @@ class Message(object):
 
 	@property
 	def missing_bytes(self):
-		return (self.length - len(self.data)) if (self.length is not None) else None
+		return ((self.length + len(self.TYPE_QUALIFIER)) - len(self.data)) if (self.length is not None) else None
 
 
 	def append(self, newdata):
@@ -255,11 +272,12 @@ class Message(object):
 				# (the previously buffered data)
 				(self.length,) = struct.unpack("!I", (self.data + newdata[0:(self.SIGNATURE_SIZE - len(self.data))])[(self.SIGNATURE_SIZE - 4):])
 
-		# time to really append however much data is missing
-		self.data += newdata[0:(self.length - len(self.data))]
+		# time to really append however much data is missing.
+		# Catch: the intended length is 1 short for qualified messages
+		self.data += newdata[0:((self.length + len(self.TYPE_QUALIFIER)) - len(self.data))]
 
 
-		if (self.AUTO_DECODE):
+		if (self.AUTO_DECODE and self.length and (not self.missing_bytes)):
 			self.decode()
 
 
@@ -278,16 +296,21 @@ class Message(object):
 			raise NotImplementedError("encode() has ben called, but %s does not implement encode_hook()" % (self.__class__.__name__))
 
 		payload = self.encode_hook()
-		self.data = (self.TYPE_QUALIFIER if hasattr(self, "TYPE_QUALIFIER") else "") + struct.pack("!I", 4 + len(payload)) + payload
+		self.length = 4 + len(payload)
+		self.data = self.TYPE_QUALIFIER + struct.pack("!I", self.length) + payload
 
 
 	def decode(self):
 		"""
-			Wrapper for the actual subclass-controlled decoder. Note that no check are in place as the hook
-			can have arbitrary rules as to whether or not it is possible to proceed
+			Wrapper for the actual subclass-controlled decoder.
 		"""
+
 		if (not hasattr(self, "decode_hook") and callable(self.decode_hook)):
 			raise NotImplementedError("decode() has ben called, but %s does not implement decode_hook()" % (self.__class__.__name__))
+
+		if ((not self.length) or self.missing_bytes):
+			raise ValueError("The message data buffer is %s" % ("empty" if (not self.length) else ("missing %d bytes" % self.missing_bytes)))
+
 		return self.decode_hook()
 
 	def __bytes__(self):
@@ -299,15 +322,16 @@ class Message(object):
 
 	def __str__(self):
 		"""
-			Subclasses are allowed to add some of their own to repr by exposing a property
+			Subclasses are allowed to add some of their own to __str__ by exposing an info_str() method
 		"""
+		# note that the type qualifier is NOT counted in the size uint of the data
 		info_str = self.info_str()
 		return ("PostgreSQL protocol message: %s[%scomplete, stated size: %s, current_size: %d]%s" % (
 			self.__class__.__name__,
-			("" if (len(self.data) == (self.length if (self.length is not None) else -1)) else "in"),
+			("" if ((len(self.data) - len(self.TYPE_QUALIFIER)) == (self.length if (self.length is not None) else -1)) else "in"),
 			(str(self.length) if (self.length is not None) else "<unknown>"),
 			len(self.data),
-			("( " + info_str + " )" if (info_str) else "")
+			("( " + (info_str if (info_str) else "undecoded") + " )")
 		))
 		
 	def __repr__(self):
@@ -339,14 +363,15 @@ class InitialMessage(Message):
 
 
 class StartupMessage(InitialMessage):
-
-	def __init__(self, start_data = b""):
-
-		self.protocol_major = None
-		self.protocol_minor = None
-		self.options = {}
-
-		super().__init__(start_data)
+	"""
+		This is what starts it all. The only piece of information is the
+		connection string, which needs to be parsed manually anyway
+	"""
+	PAYLOAD_MEMBERS = {
+		"protocol_major": None,
+		"protocol_minor": None,
+		"options": {}
+	}
 
 
 	def append(self, newdata):
@@ -359,22 +384,18 @@ class StartupMessage(InitialMessage):
 
 	def decode_hook(self):
 		""" Just extracts version information """
-		if (self.length and (not self.missing_bytes)):
-			(self.protocol_major, self.protocol_minor) = struct.unpack("!HH", (self.data[4:6] + self.data[6:8]))
-			
-			# we break the connection string into pieces
-			opt_n = None
-			for cnn_opt_w in self.data[8:-1].split(b"\x00"):
-				if (opt_n is None):
-					opt_n = cnn_opt_w.decode()
-				else:
-					self.options[opt_n] = cnn_opt_w.decode()
-					opt_n = None
+		(self.protocol_major, self.protocol_minor) = struct.unpack("!HH", (self.data[4:6] + self.data[6:8]))
 
+		# we break the connection string into pieces
+		opt_n = None
+		for cnn_opt_w in self.data[8:-1].split(b"\x00"):
+			if (opt_n is None):
+				opt_n = cnn_opt_w.decode()
+			else:
+				self.options[opt_n] = cnn_opt_w.decode()
+				opt_n = None
 
-			return True
-		else:
-			return False
+		return True
 
 	def info_str(self):
 		if ((self.protocol_major and self.protocol_minor) is not None):
@@ -383,13 +404,10 @@ class StartupMessage(InitialMessage):
 			return "protocol information unknown"
 
 
-		
-
 class CancelRequest(InitialMessage):
 	ALLOWED_RECIPIENTS = PeerType.BackEnd
 	AUTO_DECODE = True
 	RESERVED_PROTOCOL_VERSION = (1234, 5678)
-
 
 
 class SSLRequest(InitialMessage):
@@ -422,7 +440,6 @@ class CommandComplete(QualifiedMessage):
 	TYPE_QUALIFIER = b"C"
 
 
-
 class Authentication(QualifiedMessage):
 	"""
 		Any of AuthenticationKerberosV5, AuthenticationCleartextPassword and so on
@@ -430,15 +447,12 @@ class Authentication(QualifiedMessage):
 	"""
 	ALLOWED_RECIPIENTS = PeerType.FrontEnd
 	TYPE_QUALIFIER = b"R"
+	PAYLOAD_MEMBERS = {
+		"mode": None,
+		"salt": None,
+		"gss_sspi_data": None
+	}
 
-	def __init__(self, start_data = b""):
-
-		self.mode = None # one of AuthenticationMode
-		self.salt = None # this only applies to some authentication schemes. It is stored as a 32 bit integer
-		self.gss_sspi_data = None # bynary string containing the GSSAPI/SPI data, if needed
-
-		super().__init__(start_data)
-		
 
 	def encode_hook(self):
 		
@@ -451,7 +465,6 @@ class Authentication(QualifiedMessage):
 
 		if ((self.mode == AuthenticationMode.GSSContinue) and (self.gss_sspi_data is None)):
 			raise(MessageEncodeError("GSSAPI/SPI authentication data is required"))
-
 		
 		out_str = struct.pack("!I", self.mode)
 		
@@ -465,13 +478,42 @@ class Authentication(QualifiedMessage):
 
 	# todo: decode hook for the backend side
 
-
 	def info_str(self):
-		
+	
 		if (self.mode is not None):
 			return "mode: %s" % (self.mode.name,)
 		else:
 			return "Unknown authentication mode"
+
+
+
+class Password(QualifiedMessage):
+	"""
+		Any of AuthenticationKerberosV5, AuthenticationCleartextPassword and so on
+		encode() is called
+	"""
+	ALLOWED_RECIPIENTS = PeerType.BackEnd
+	TYPE_QUALIFIER = b"p"
+	PAYLOAD_MEMBERS = {
+		"password": None
+	}
+	VALID_START_STATES = {
+		PeerType.FrontEnd: (SessionState.WaitingForCredentials,)
+	}
+
+	AUTO_DECODE = True
+	def decode_hook(self):
+		self.password = self.data[self.SIGNATURE_SIZE:].decode()
+		return True
+
+	def encode_hook(self):
+		if (not isinstance(self.password, str)):
+			raise MessageEncodeError("Password property is not set/invalid")
+		return self.password.encode()
+
+
+	def info_str(self):
+		return "<security info hidden>"
 
 
 
@@ -483,7 +525,8 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 		if (len(msg_class.TYPE_QUALIFIER) != 1):
 			raise ValueError("Invalid TYPE_QUALIFIER lenght for class %s" % (msg_class.__name__))
 
-		MESSAGE_QUALIFIERS_CLASSES[msg_class.TYPE_QUALIFIER] = msg_class
+		# note that we store it as an integer
+		MESSAGE_QUALIFIERS_CLASSES[msg_class.TYPE_QUALIFIER[0]] = msg_class
 
 	# also, we pack some attribute to avoid having to do it at "run-time"
 	if ((isinstance(msg_class, type)) and issubclass(msg_class, InitialMessage)):
