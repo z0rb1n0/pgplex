@@ -16,6 +16,10 @@ LOGGER = logging.getLogger(__name__)
 See https://www.postgresql.org/docs/current/static/protocol-message-formats.html
 for postgres protocol documentation
 
+
+A lot of refactoring is called for, primarily for performance reasons:
+we need to either switch to pre-compiled pack() strings or memviews
+
 """
 
 
@@ -33,6 +37,10 @@ class MessageDecodeError(Exception):
 
 
 
+
+
+
+
 # STATE FLOW MANAGEMENT
 class SessionState(enum.IntEnum):
 	"""
@@ -40,10 +48,20 @@ class SessionState(enum.IntEnum):
 		and by extension a pgplex *StreamSession, can be in.
 	"""
 
-	# the following only happen at startup
+	# Generally Backend
 	WaitingForInitialMessage = 1
 	WaitingForCredentials = 2
-	WaitingForCommand = 3
+	SettingUpSession = 3
+	WaitingForQuery = 4
+	Active = 5
+
+
+	# Generally Frontend
+	WaitingForSSLClearance = 1025
+	WaitingForAuthenticationMode = 1026
+	WaitingForSessionSetup = 1027
+	Idling = 1028
+	WaitingForResultState = 1029
 
 
 class PeerType(enum.Enum):
@@ -51,17 +69,14 @@ class PeerType(enum.Enum):
 		"Places" pgplex talks to. Useful to indicate directionality of a message
 
 		Every member contains a set of the possible SessionState values a particular
-		PeerType-controlled stream can possibly be in.
+		stream peer type
 		
-		NOTE:	the naming is somewhat counter-intuitive, as FrontEnd-type peers actually
-				mean backend-type sessions and the other way around for BackEnd-type peers.
-				This is because the naming indicates what's on the other side
+		
+
 	"""
-	BackEnd = set(())
-	FrontEnd = set((SessionState.WaitingForInitialMessage, SessionState.WaitingForCredentials))
+	BackEnd = set((SessionState.WaitingForInitialMessage, SessionState.WaitingForCredentials, SessionState.SettingUpSession))
+	FrontEnd = set((SessionState.WaitingForSSLClearance,SessionState.WaitingForAuthenticationMode,SessionState.WaitingForSessionSetup))
 	
-
-
 
 class AuthenticationMode(enum.IntEnum):
 	"""
@@ -76,6 +91,24 @@ class AuthenticationMode(enum.IntEnum):
 	GSS = 7
 	SSPI = 9
 	GSSContinue = 9
+
+
+
+
+class TransactionState(enum.IntEnum):
+	"""
+		Possible values for the transaction state of a Session.
+
+		They encode the characters for the state
+	"""
+	Idle = ord("I")
+	IdleInTransaction = ord("T")
+	TransactionFailed = ord("E")
+
+
+
+
+
 
 # In order to quickly decode authentication states into enum values,
 # we create a map of authentication states by number,
@@ -145,9 +178,9 @@ class Message(object):
 	# Note that it is indexed by [PeerType] and each member is then the list
 	# example override:
 	# VALID_START_STATES = {
-	# 		PeerType.FrontEnd] = (pg_streams.BackEndState.WaitingForInitialMessage,)
+	# 		PeerType.BackendEnd] = (pg_streams.BackEndState.WaitingForInitialMessage,)
 	VALID_START_STATES = {}
-	
+
 
 	# this dynamically initializes the special propertes of each message type,
 	# (what would be members of a struct in C) without having to override each subclass __init__)
@@ -305,13 +338,17 @@ class Message(object):
 			Wrapper for the actual subclass-controlled decoder.
 		"""
 
-		if (not hasattr(self, "decode_hook") and callable(self.decode_hook)):
-			raise NotImplementedError("decode() has ben called, but %s does not implement decode_hook()" % (self.__class__.__name__))
-
 		if ((not self.length) or self.missing_bytes):
 			raise ValueError("The message data buffer is %s" % ("empty" if (not self.length) else ("missing %d bytes" % self.missing_bytes)))
 
-		return self.decode_hook()
+		# decode hook is not needed if the message is just its signature
+		if (len(self.PAYLOAD_MEMBERS)):
+			if (not hasattr(self, "decode_hook") and callable(self.decode_hook)):
+				raise NotImplementedError("decode() has ben called, but %s does not implement decode_hook()" % (self.__class__.__name__))
+
+			return self.decode_hook()
+		else:
+			return True
 
 	def __bytes__(self):
 		return self.data
@@ -331,7 +368,7 @@ class Message(object):
 			("" if ((len(self.data) - len(self.TYPE_QUALIFIER)) == (self.length if (self.length is not None) else -1)) else "in"),
 			(str(self.length) if (self.length is not None) else "<unknown>"),
 			len(self.data),
-			("( " + (info_str if (info_str) else "undecoded") + " )")
+			("( " + (info_str if (info_str) else "<undescribed>") + " )")
 		))
 		
 	def __repr__(self):
@@ -358,7 +395,7 @@ class InitialMessage(Message):
 
 	# this can safely be inherited by all startup message types
 	VALID_START_STATES = {
-		PeerType.FrontEnd: (SessionState.WaitingForInitialMessage,)
+		PeerType.BackEnd: (SessionState.WaitingForInitialMessage,)
 	}
 
 
@@ -373,13 +410,7 @@ class StartupMessage(InitialMessage):
 		"options": {}
 	}
 
-
-	def append(self, newdata):
-		""" The startup message is always decoded when possible """
-		super().append(newdata)
-
-		# this message is always decoded regardless
-		self.decode()
+	AUTO_DECODE = True
 
 
 	def decode_hook(self):
@@ -390,16 +421,16 @@ class StartupMessage(InitialMessage):
 		opt_n = None
 		for cnn_opt_w in self.data[8:-1].split(b"\x00"):
 			if (opt_n is None):
-				opt_n = cnn_opt_w.decode()
+				opt_n = cnn_opt_w
 			else:
-				self.options[opt_n] = cnn_opt_w.decode()
+				self.options[opt_n] = cnn_opt_w
 				opt_n = None
 
 		return True
 
 	def info_str(self):
 		if ((self.protocol_major and self.protocol_minor) is not None):
-			return "protocol version: %d.%d, options: %s" % (self.protocol_major, self.protocol_minor, str(self.options))
+			return "protocol version: %d.%d, options: %s" % (self.protocol_major, self.protocol_minor, self.options)
 		else:
 			return "protocol information unknown"
 
@@ -435,9 +466,6 @@ class QualifiedMessage(Message):
 	TYPE_QUALIFIER = b"\x00"
 
 
-class CommandComplete(QualifiedMessage):
-	ALLOWED_RECIPIENTS = PeerType.FrontEnd
-	TYPE_QUALIFIER = b"C"
 
 
 class Authentication(QualifiedMessage):
@@ -452,7 +480,7 @@ class Authentication(QualifiedMessage):
 		"salt": None,
 		"gss_sspi_data": None
 	}
-
+	AUTO_DECODE = True
 
 	def encode_hook(self):
 		
@@ -498,22 +526,178 @@ class Password(QualifiedMessage):
 		"password": None
 	}
 	VALID_START_STATES = {
-		PeerType.FrontEnd: (SessionState.WaitingForCredentials,)
+		PeerType.BackEnd: (SessionState.WaitingForCredentials,)
 	}
 
 	AUTO_DECODE = True
 	def decode_hook(self):
-		self.password = self.data[self.SIGNATURE_SIZE:].decode()
+		self.password = self.data[self.SIGNATURE_SIZE:-1]
 		return True
 
 	def encode_hook(self):
-		if (not isinstance(self.password, str)):
+		if (not isinstance(self.password, bytes)):
 			raise MessageEncodeError("Password property is not set/invalid")
-		return self.password.encode()
+		return self.password
 
 
 	def info_str(self):
 		return "<security info hidden>"
+
+
+class BackendKeyData(QualifiedMessage):
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"K"
+	PAYLOAD_MEMBERS = {
+		"backend_pid": None,
+		"secret_key": None
+	}
+	VALID_START_STATES = {
+		PeerType.FrontEnd: (SessionState.WaitingForSessionSetup,)
+	}
+
+	AUTO_DECODE = True
+
+	def decode_hook(self):
+		(self.backend_pid) = struct.unpack("!I", self.data[self.SIGNATURE_SIZE:4])
+		self.secret_key = self.data[self.SIGNATURE_SIZE + 4:4]
+		return True
+
+	def encode_hook(self):
+		return struct.pack("!I", self.backend_pid) + self.secret_key
+
+	def info_str(self):
+		return "process ID: %d, secret key: `%s`" % (self.backend_pid, self.secret_key)
+
+
+
+class ReadyForQuery(QualifiedMessage):
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"Z"
+	PAYLOAD_MEMBERS = {
+		"transaction_state": None
+	}
+	VALID_START_STATES = {
+		PeerType.FrontEnd: (SessionState.WaitingForSessionSetup,)
+	}
+	AUTO_DECODE = True
+	# unfortunately in the case of ReadyForQuery we need to create a member that allows to translate
+	# a number into an enum member
+	TS_MAP = {}
+
+	def decode_hook(self):
+		state_code = ord(self.data[self.SIGNATURE_SIZE:1])
+
+		try:
+			self.transaction_state = self.TS_MAP[state_code]
+		except KeyError:
+			raise MessageDecodeError("Invalid transaction state byte: %d" % state_code)
+
+		return True
+
+	def encode_hook(self):
+		return bytes([self.transaction_state.value])
+
+	def info_str(self):
+		return self.transaction_state.name
+
+# here we backfill the translation map
+for m in TransactionState:
+	ReadyForQuery.TS_MAP[m.value] = m
+	
+
+
+class ParameterStatus(QualifiedMessage):
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"S"
+	PAYLOAD_MEMBERS = {
+		"parameter": None,
+		"value": None
+	}
+	VALID_START_STATES = {
+		PeerType.FrontEnd: (SessionState.WaitingForSessionSetup,SessionState.Idling)
+	}
+	AUTO_DECODE = True
+
+	def decode_hook(self):
+		(self.parameter, self.value) = self.data[self.SIGNATURE_SIZE:-1].split(b"\x00")
+		return True
+
+
+	def encode_hook(self):
+		return b"\x00".join((self.parameter, self.value)) + b"\x00"
+		return True
+
+	def info_str(self):
+		return "%s = %s" % (self.parameter, self.value)
+	
+
+
+class Terminate(QualifiedMessage):
+	ALLOWED_RECIPIENTS = PeerType.BackEnd
+	TYPE_QUALIFIER = b"X"
+	VALID_START_STATES = {
+		PeerType.BackEnd: (SessionState.WaitingForQuery,)
+	}
+	AUTO_DECODE = True
+
+
+
+class Query(QualifiedMessage):
+	"""
+		Simple query protocol. Will always be my favorite
+	"""
+	ALLOWED_RECIPIENTS = PeerType.BackEnd
+	TYPE_QUALIFIER = b"Q"
+	PAYLOAD_MEMBERS = {
+		"query": None
+	}
+	VALID_START_STATES = {
+		PeerType.BackEnd: (SessionState.WaitingForQuery,)
+	}
+
+	AUTO_DECODE = True
+	def decode_hook(self):
+		self.query = self.data[self.SIGNATURE_SIZE:-1]
+		return True
+
+	def encode_hook(self):
+		if (not isinstance(self.query, bytes)):
+			raise MessageEncodeError("Query is not set")
+		return self.password
+
+
+	def info_str(self):
+		return self.query.replace(b"\x10", b"\x10\x10").decode()[0:32]
+
+
+class ErrorResponse(QualifiedMessage):
+	"""
+		This is tricky as it requires a fair deal of parsing
+	"""
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"E"
+	PAYLOAD_MEMBERS = {
+		# this is an array of tuples
+		"messages": []
+	}
+	VALID_START_STATES = {
+		PeerType.FrontEnd: (SessionState.WaitingForResultState,)
+	}
+	AUTO_DECODE = True
+	
+	def decode_hook(self):
+		self.messages = [(ml[:1], ml[1:]) for ml in self.data[self.SIGNATURE_SIZE:-1].split(b"\x00\x00")]
+
+		return True
+
+	def encode_hook(self):
+		if (not len(self.messages)):
+			raise MessageEncodeError("There are no message strings")
+		return b"\x00".join(((mh + mb) for (mh, mb) in self.messages)) + b"\x00\x00"
+	
+	def info_str(self):
+		return "%s" % (self.messages,)
+
 
 
 
@@ -534,5 +718,4 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 			msg_class.RESERVED_PROTOCOL_VERSION_PACKED = b"".join(
 				map(lambda v : v.to_bytes(length = 2, byteorder = "big"), msg_class.RESERVED_PROTOCOL_VERSION)
 			)
-
 

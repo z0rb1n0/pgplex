@@ -15,6 +15,8 @@ import log_manager
 import info
 import guc
 import psycopg2
+import psycopg2.extras
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -23,3 +25,8 @@ cnn_str = "host=localhost dbname=pgplex user=bleh password=yolo sslmode=require"
 
 
 conn = psycopg2.connect(cnn_str)
+conn.set_session(autocommit = True)
+
+cur = conn.cursor()
+
+cur.execute("SELECT 1;")

@@ -5,6 +5,7 @@ import logging
 import ipc_streams
 import enum
 import select
+import random
 import ssl
 
 
@@ -15,10 +16,6 @@ LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_BUFFER_SIZE = 16384
-
-
-
-
 
 
 
@@ -56,6 +53,24 @@ class DownStreamSession(ipc_streams.Stream):
 			pg_messages.PeerType.FrontEnd: [ b"", b"", [] ],
 			pg_messages.PeerType.BackEnd: [ b"", b"", [] ]
 		}
+
+
+		# this is important when we receive cancellation keys and we need to
+		# forward them. We need to keep 2 of them, one is the one the frontend is
+		# expected to send us, the other one is the one the backend expects us to
+		# send it. We also need to store the backend PID.
+		# Backend information is valid only for the duration of a lease
+		# the frontend information is just the key (signed), however the backend is
+		# a 2 tuple storing the remote PID and its key, stored as bytes
+		# The whole member is (None when there is no lease)
+		self.cancel_keys = {
+			pg_messages.PeerType.FrontEnd: bytes(random.randint(0, 255) for l in "...."),
+			pg_messages.PeerType.BackEnd: None
+		}
+
+
+		# whatever setting the client passed in the startupmessage go here
+		self.client_supplied_defaults = {}
 
 
 		# downstreams sessions are always inbound
@@ -98,6 +113,8 @@ class DownStreamSession(ipc_streams.Stream):
 			#LOGGER.debug("Received buffer: %s", new_buf)
 
 			# which socket did we receive the chunk/event on?
+			# Note that this indicates what the socket is connected to, not our
+			# role in that connection
 			origin = pg_messages.PeerType.FrontEnd if (events[0][0] is readers[0]) else pg_messages.PeerType.BackEnd
 			if (len(new_buf)):
 				self.mail_boxes[origin][0] += new_buf
@@ -179,7 +196,7 @@ class DownStreamSession(ipc_streams.Stream):
 
 					#LOGGER.debug("Bytes consumed: %d" % consumed)
 					# it is now time to remove the consumed data from the buffer and
-					# if this turns into a speed issue, ctypes/bytearrays could help
+					# if this turns into a speed issue, ctypes/bytearrays/memviews could help
 					if (consumed):
 						self.mail_boxes[box][0] = self.mail_boxes[box][0][consumed:]
 
@@ -197,6 +214,25 @@ class DownStreamSession(ipc_streams.Stream):
 				return (nm)
 
 		raise Exception("Flow should never have reached this point")
+
+
+
+	def send_message(self, peer_type, message):
+		"""
+			Simply forwards the message to either side. In the case of the
+			pool, this is likely to be a simple socket wakeup signal
+			Args:
+				peer_type:		(pg_messages.PeerType)Where to
+				message:		(pg_messages.Message)What
+				
+			Returns the amount of bytes sent
+		"""
+		
+		LOGGER.debug("Sending to %s: %s", peer_type.name, message)
+		if (peer_type is pg_messages.PeerType.FrontEnd):
+			return self.connection.send(bytes(message))
+		else:
+			NotImplementedException("Cannot send messages to %s yet" % (peer_type.name))
 
 
 
@@ -239,9 +275,12 @@ class DownStreamSession(ipc_streams.Stream):
 
 
 			# time to check if the state is good for this peer type/backend state
-			if ((src_peer in msg.VALID_START_STATES) and (self.state in msg.VALID_START_STATES[src_peer])):
-				pass
-			else:
+			# note that our local process is the opposite backend type to the peer,
+			# so we need to invert it
+			
+			dst_peer = pg_messages.PeerType.BackEnd if (src_peer is pg_messages.PeerType.FrontEnd) else pg_messages.PeerType.FrontEnd
+
+			if ((dst_peer not in msg.VALID_START_STATES) or (self.state not in msg.VALID_START_STATES[dst_peer])):
 				LOGGER.error("Invalid message %s for current %s-facing stream in state %s",
 					msg.__class__.__name__, src_peer.name, self.state.name
 				)
@@ -275,39 +314,76 @@ class DownStreamSession(ipc_streams.Stream):
 
 					LOGGER.debug("%s SSL initiation request from peer %s" % ("Granted" if (ssl_enabled) else "Denied", self))
 
+
 				elif (isinstance(msg, pg_messages.StartupMessage)):
+
+					# we put away the default
+					self.client_supplied_defaults = msg.options
 
 					auth_request = pg_messages.Authentication()
 					auth_request.mode = pg_messages.AuthenticationMode.MD5Password
 					auth_request.encode()
-					self.send_message(pg_messages.PeerType.FrontEnd, auth_request)
+					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = auth_request)
 					self.state = pg_messages.SessionState.WaitingForCredentials
+
 
 				elif (isinstance(msg, pg_messages.Password)):
 
 					auth_ok = pg_messages.Authentication()
 					auth_ok.mode = pg_messages.AuthenticationMode.Ok
 					auth_ok.encode()
-					self.send_message(pg_messages.PeerType.FrontEnd, auth_ok)
-					self.state = pg_messages.SessionState.WaitingForCommand
+					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = auth_ok)
+					self.state = pg_messages.SessionState.SettingUpSession
 					pop_timeout = None
 
-
-	def send_message(self, peer_type, message):
-		"""
-			Simply forwards the message to either side. In the case of the
-			pool, this is likely to be a simple socket wakeup signal
-			Args:
-				peer_type:		(pg_messages.PeerType)Where to
-				message:		(pg_messages.Message)What
-				
-			Returns the amount of bytes sent
-		"""
-		
-		LOGGER.debug("Sending to %s: %s", peer_type.name, message)
-		if (peer_type is pg_messages.PeerType.FrontEnd):
-			return self.connection.send(bytes(message))
-		else:
-			NotImplementedException("Cannot send messages to %s yet" % (peer_type.name))
+					cancel_key = pg_messages.BackendKeyData()
+					cancel_key.backend_pid = self._owner_pid
+					cancel_key.secret_key = self.cancel_keys[pg_messages.PeerType.FrontEnd]
+					cancel_key.encode()
+					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = cancel_key)
 
 
+
+					enc = self.client_supplied_defaults["client_encoding"].decode() if "client_encoding" in self.client_supplied_defaults else "UTF8"
+
+					for (par, val) in (
+						("server_encoding", enc),
+						("client_encoding", enc),
+						("DateStyle", "ISO")
+					):
+						parm = pg_messages.ParameterStatus()
+						parm.parameter = par.encode()
+						parm.value = val.encode()
+						parm.encode()
+						self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = parm)
+
+
+					self.state = pg_messages.SessionState.WaitingForQuery
+
+
+				elif (isinstance(msg, pg_messages.Terminate)):
+					LOGGER.info("Session terminating at frontend's request")
+					self.shutdown()
+					sys.exit()
+
+
+				elif (isinstance(msg, pg_messages.Query)):
+
+					self.state = pg_messages.SessionState.Active
+
+					bartek = pg_messages.ErrorResponse()
+					bartek.messages.append((b"C", b"XX000"))
+					bartek.messages.append((b"M", b"Nothing is implemented yet"))
+					bartek.messages.append((b"H", b"Time to get off your ass and help Fabio with commits. Glory awaits :-)"))
+					bartek.encode()
+					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = bartek)
+
+
+					self.state = pg_messages.SessionState.WaitingForQuery
+			
+			
+				if (self.state == pg_messages.SessionState.WaitingForQuery):
+					ready_q = pg_messages.ReadyForQuery()
+					ready_q.transaction_state = pg_messages.TransactionState.Idle
+					ready_q.encode()
+					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = ready_q)
