@@ -12,13 +12,56 @@ LOGGER = logging.getLogger(__name__)
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 """
 See https://www.postgresql.org/docs/current/static/protocol-message-formats.html
 for postgres protocol documentation
 
 
 A lot of refactoring is called for, primarily for performance reasons:
-we need to either switch to pre-compiled pack() strings or memviews
+
+
+# this is how we can address this issue efficiently:
+import ctypes as c
+import array as a
+
+class MessageQualifier(c.c_char):
+	pass
+
+class MessageSize(c.c_uint32):
+	pass
+
+class QualifiedMessage(c.BigEndianStructure):
+	_pack_ = 0
+	_fields_ = [
+		("qualifier", MessageQualifier),
+		("size", MessageSize),
+		("payload", c.c_char * 256)
+	]
+
+
+buf = bytearray(c.sizeof(QualifiedMessage))
+
+msg = QualifiedMessage.from_buffer(buf, 0)
+print(buf)
+msg.qualifier = b"c"
+msg.size = c.sizeof(msg) - c.sizeof(MessageQualifier)
+msg.payload = b"hello"
+print(buf)
+
+
 
 """
 
