@@ -8,12 +8,259 @@ import struct
 import random
 
 
+
+
+
 LOGGER = logging.getLogger(__name__)
 
+import ctypes
+
+# we don't rely on the defaults as WORD_BIT is often broken
+CPU_WORD_SIZE = ctypes.sizeof(ctypes.c_void_p)
+
+
+# list of classes that allow the calling of the from_bytes() constructor
+# we identify them by name to avoid circular dependencies in the declaration
+MAGIC_CLASSES = set(("InitialMessage", "QualifiedMessage"))
+
+# this is a list of classes we're not allowed to instantiate directly. Unfortunately
+# we have to construct it at the bottom to elude circular dependencies
+BLACKLISTED_MSG_CLASS_INSTANTIATIONS = set()
+
+
+class MessageSize(ctypes.c_uint32):
+	pass
+
+class MessageQualifier(ctypes.c_char):
+	pass
+
+
+class PGMessageStruct(ctypes.BigEndianStructure):
+	_pack_ = 1
+	"""
+		Generic class all postgres protocol messages/headers/fragments are based on
+
+		We can't pad as the protocol has arbitrarily aligned numerical
+		values in the members we might need to access (probably inefficiently).
+
+		The most accessed fields will be the header fields, which are at known positions
+		and need to be as aligned as we can (the size in particular)
+
+		For most message types, the backend protocol requires an initial 1-byte
+		message qualifier. Given that we intend to access members - and those are
+		likely to be on 4 byte boundaries - we need to manually pad that byte to the
+		word size to prevent alignment issues. The presented message will be
+		at an offset of sizeof(word) - 1. (This wastes nearly a full word)
+
+		The buffer for unqualified messages starts with the size.
+		
+	"""
+
+
+class MessageHeader(PGMessageStruct):
+	"""
+		Basic message header class.
+		
+		It has no structure of its own, however different header family
+		types can append/prepend/intermingle header fields to this
+	"""
+	_fields_ = []
+	# this indicates how far into the padding the actual header starts
+	_data_offset_ = 0
+		
+
+
+
+class InitialMessageHeader(MessageHeader):
+	"""
+		Initial message header has only size (and in most cases that's a lie as
+		it gets usurped with reserved values)
+	"""
+	_fields_ = [("length", MessageSize)] + MessageHeader._fields_
+	
+
+class QualifiedMessageHeader(MessageHeader):
+	"""
+		Qualified message header prepends a qualifier to the initial message header.
+		Note the padding member to align with the word size
+	"""
+	_fields_ = [
+		("_tq_padding_", (MessageQualifier * (CPU_WORD_SIZE - 1))),
+		("qualifier", MessageQualifier)
+	] + InitialMessageHeader._fields_
+	_data_offset_ = ctypes.sizeof(_fields_[0][1])
+
+
+class MessagePayload(PGMessageStruct):
+	"""
+		Base class for MessagePayload.
+		The default payload is empty
+	"""
+	_fields_ = []
+
+
+class Message():
+	"""
+		Messages can be constructed in 2 ways:
+		- traditional constructor:
+					The constructor accepts all the relevant payload member
+					values and builds the byte array which is directly mapped to
+					the members as a structure
+
+		- {Initial|Qualified}Message.from_bytes(msg_data)
+					See the class method documentation
+	"""
+	
+	_header_definition_ = MessageHeader
+	_payload_definition_ = MessagePayload
+	@classmethod
+	def from_bytes(cls, data_buffer, copy_buffer = True):
+		"""
+			Much like, say, int's from_bytes(), this class method constructs the appropriate
+			message type based on the initial chunks of the passed buffer.
+			More specifically, it expects at least the message signature to instantiate the
+			right class and allocate a buffer of appropriate size.
+
+			Can only be called on generic classes InitialMessage and QualifiedMessage, but not
+			their parent Message class as it is impossible to ascertain if a message has a
+			type qualifier or not just by looking at the signature.
+			(InitialMessage message types form a small family of initial legacy messages that
+			unfortunately have no qualifier byte)
+			
+			It never actually instatiates from the class it's called from: it returns the
+			appropriate subclass based on what was determined.
+
+			The resulting object always presents properties defined according to what overrides
+			the subclass implement in their members. More specifically:
+			
+			_header_definition_:		(MessageHeader)
+					Subclasses of ctypes.BigEndianStructure
+					Dictates the size and structure of the message signature.
+					Message type/size inferrance are possible only after enough
+					bytes have been collected to fill this structure
+
+
+			_payload_definition_:		(MessagePayload)
+					Subclasses of ctypes.BigEndianStructure
+					For messages with a fixed structure, this dictates how the
+					buffer is initialized and properties are mapped.
+					
+					It is dynamically built/altered when callers use the
+					specific generation methods of dynamic message formats
+
+					It is also built based on the incoming data when the
+					message structure is not fixed (eg: nested data)
+
+
+			Args:
+				data_buffer:		(bytearray)	The buffer the message must be constructed from.
+												Needs to be at least as long as the message header lenght
+												for the correct base class
+
+
+				copy_buffer:		(boolean)	If not set, causes the message to be directly built against
+												the passed data as opposed to copied
+												WARNING: this means that modifying the string from the caller
+												will cause the message to change even after it has been built
+												(much like C *char[] works)
+		"""
+
+		if (cls.__name__ not in MAGIC_CLASSES):
+			raise TypeError("%s does not allow costruction from a data buffer. Please use one of: %s" % (cls.__name__, ", ".join(MAGIC_CLASSES)))
+
+
+		out_obj = object.__new__(cls)
+		
+		return out_obj
+
+
+	def __new__(cls):
+
+		# a message class can only be directly instantiated if it's not a magic one or above it
+		if (cls in BLACKLISTED_MSG_CLASS_INSTANTIATIONS):
+			raise TypeError("%s cannot be instantiated directly. Please use a subclass" % (cls.__name__))
 
 
 
 
+class InitialMessage(Message):
+	"""
+		See the parent for the generic overridable class members of Messages.
+		This subclass only describes and defines overrides that apply specifically to it
+		
+			RESERVED_PROTOCOL_VERSION:		(2-tuple)	
+	"""
+	_header_definition_ = InitialMessageHeader
+
+	# some of the unqualified message types usurp the protocol version declaration
+	# state their message type instead (eg: CancelRequest).
+	# message types that do
+	_reserved_protocol_version_ = None
+
+class QualifiedMessage(Message):
+	"""
+		See the parent for the generic overridable class members of Messages.
+		This subclass only describes and defines overrides that apply specifically to it
+
+			TYPE_QUALIFIER:			(MessageQualifier)	For qualified messages, it indicates what message qualifier
+														causes the instantiation of this particular class of message
+	"""
+	_header_definition_ = QualifiedMessageHeader
+
+
+def get_class_ancestors(bl_cls):
+	out_s = set(filter(lambda mc : issubclass(mc, Message), bl_cls.__bases__))
+	for bc in set(out_s):
+		out_s.update(get_class_ancestors(bc))
+	out_s.update((bl_cls,))
+	return out_s
+# we populate the list of what cannot be instantiated directory
+# (all magic classes and their parents
+for mag_class in map(lambda cn : globals()[cn], MAGIC_CLASSES):
+	BLACKLISTED_MSG_CLASS_INSTANTIATIONS.update(set(get_class_ancestors(mag_class)))
+del(get_class_ancestors)
+
+
+
+class SSLRequest(InitialMessage):
+	_header_definition_ = InitialMessageHeader
+	RESERVED_PROTOCOL_VERSION = (1234, 5679)
+
+
+x = InitialMessage.from_bytes("")
+
+print(x)
+
+
+
+# 	def __new__(cls):
+# 		out_class = type("StartupMessage", (cls,), {"_fields_": [("x", ctypes.c_char)]})
+# 		
+# 		out_class.__init__ = lambda self: print(self.__class__.__name__)
+# 		return super().__new__(out_class)
+
+
+
+# class SSLRequest(InitialMessage):
+# 	RESERVED_PROTOCOL_VERSION = (1234, 5678)
+
+
+
+
+# class QualifiedMessage(Message):
+# 	_header_definition_ = [QualifiedMessageHeader]
+
+
+# x = InitialMessage()
+
+#print(type(x))
+
+
+
+
+
+
+sys.exit(0)
 
 
 
@@ -76,9 +323,6 @@ class MessageEncodeError(Exception):
 	
 class MessageDecodeError(Exception):
 	pass
-
-
-
 
 
 
