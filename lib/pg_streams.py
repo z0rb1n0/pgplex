@@ -182,9 +182,8 @@ class DownStreamSession(ipc_streams.Stream):
 						else:
 							expected_message_class = pg_messages.QualifiedMessage
 
-
 						if (inbox_bc >= expected_message_class.SIGNATURE_SIZE):
-							msgs[box] = expected_message_class(self.mail_boxes[box][0])
+							msgs[box] = expected_message_class.from_buffer(self.mail_boxes[box][0])
 							consumed = len(msgs[box].data)
 					else:
 						# the message already knows how much data it needs,

@@ -20,11 +20,6 @@ LOGGER = logging.getLogger(__name__)
 
 
 
-
-
-
-
-
 """
 See https://www.postgresql.org/docs/current/static/protocol-message-formats.html
 for postgres protocol documentation
@@ -76,11 +71,6 @@ class MessageEncodeError(Exception):
 	
 class MessageDecodeError(Exception):
 	pass
-
-
-
-
-
 
 
 
@@ -163,8 +153,6 @@ for auth_state in AuthenticationMode:
 
 
 
-
-
 class Message(object):
 	"""
 		Base class all postgres protocol message classes are constructed from.
@@ -231,16 +219,22 @@ class Message(object):
 	# the value
 	PAYLOAD_MEMBERS = {}
 
-
-	def __new__(cls, *args, **kwargs):
+	@classmethod
+	def from_buffer(cls, start_data):
 		"""
+			Accepts a bytearray structure and instantiates a Message subclass.
+
 			Depending what we've got in our hands, we determine which REAL class needs
 			to be constructed.
 
 			We only try to get guess the type when instatiation happens from the
 			generic classes for the 2 message types (InitialMessage and QualifiedMessage)
-			
+
 			Message cannot be instaniated directly (it's kinda abstract)
+			
+
+			Ideally we should start using ctypes structures for this
+			
 			
 		"""
 
@@ -253,7 +247,6 @@ class Message(object):
 		# subclass
 		# This check is done on the class name to avoid having dealing with circular dependencies
 
-
 		cls_name = cls.__name__
 		out_class = cls
 
@@ -261,11 +254,7 @@ class Message(object):
 
 			#LOGGER.debug("Magic message type `%s` was instantiated" % cls_name)
 
-			if (len(args) and isinstance(args[0], bytes) and (len(args[0]) >= cls.SIGNATURE_SIZE)):
-				start_data = args[0]
-			elif (("start_data" in kwargs) and isinstance(args["kwargs"], bytes) and (len(args["kwargs"]) >= cls.SIGNATURE_SIZE)):
-				start_data = kwargs["start_data"]
-			else:
+			if (not (len(start_data) >= cls.SIGNATURE_SIZE)):
 				raise ValueError("Magic instantiation of %s requires a `bytes` instace at least %d bytes long as the start data" % (
 					cls.__name__,
 					cls.SIGNATURE_SIZE
@@ -273,7 +262,7 @@ class Message(object):
 				return None
 
 			out_class = None
-			
+
 			if (cls_name == "InitialMessage"):
 				# there's a very small number of initial messages. No need for a lookup table yet
 				for im_class in cls.__subclasses__():
@@ -291,16 +280,13 @@ class Message(object):
 
 				out_class = MESSAGE_QUALIFIERS_CLASSES[start_data[0]]
 
+		out_obj = out_class()
+		out_obj.append(start_data)
 
-		out_obj = object.__new__(out_class)
-		
-		
 		return out_obj
 
 
-	def __init__(self,
-		start_data = b""
-	):
+	def __init__(self):
 		"""
 			The message itself can be initialized empty
 		"""
@@ -316,10 +302,6 @@ class Message(object):
 		# we initialize the payload-specific attributes.
 		for pm in self.PAYLOAD_MEMBERS:
 			setattr(self, pm, self.PAYLOAD_MEMBERS[pm])
-
-		
-		if (len(start_data)):
-			self.append(start_data)
 
 
 		#print("Init of %s completed. Data: %s" % (self.__class__.__name__, start_data))
