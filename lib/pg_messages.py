@@ -5,8 +5,8 @@ import logging
 import ipc_streams
 import enum
 import struct
+import pprint
 import random
-
 
 
 
@@ -24,15 +24,14 @@ CPU_WORD_SIZE = ctypes.sizeof(ctypes.c_void_p)
 MAGIC_CLASSES = set(("InitialMessage", "QualifiedMessage"))
 
 # this is a list of classes we're not allowed to instantiate directly. Unfortunately
-# we have to construct it at the bottom to elude circular dependencies
+# we have to construct it at the bottom to elude circular dependencies.
+# This contains the actual class references
 BLACKLISTED_MSG_CLASS_INSTANTIATIONS = set()
 
 
 # this is a quick lookup table that resolves message qualifiers into the
 # correct QualifiedMessage class
 MESSAGE_QUALIFIERS_CLASSES = {}
-
-
 
 
 
@@ -65,8 +64,6 @@ class PeerType(enum.Enum):
 
 		Every member contains a set of the possible SessionState values a particular
 		stream peer type
-		
-		
 
 	"""
 	BackEnd = set((SessionState.WaitingForInitialMessage, SessionState.WaitingForCredentials, SessionState.SettingUpSession))
@@ -112,23 +109,35 @@ for auth_state in AuthenticationMode:
 
 
 
+# Message components. Unfortunately subclassing ctypes base types seems to
+# confuse the initialization, so we just bind the types to variables instead
+
+# This is what we wanted to do:
+# class MessageSize(ctypes.c_uint32):
+# 	pass
+
+# class ProtocolVersionMember(ctypes.c_uint16):
+# 	pass
+
+# class MessageTypeQualifier(ctypes.c_char):
+# 	pass
+
+# class PayloadByteFormat(ctypes.c_char):
+# 	pass
 
 
-# Message components
-
-class MessageSize(ctypes.c_uint32):
-	pass
-
-class MessageTypeQualifier(ctypes.c_char):
-	pass
+# This is what we're forced to do:
+MessageSize = ctypes.c_uint32
+ProtocolVersionMember = ctypes.c_uint16
+MessageTypeQualifier = ctypes.c_char
+PayloadByteFormat = ctypes.c_char
 
 
 class PGMessageStruct(ctypes.BigEndianStructure):
-	_pack_ = 1
 	"""
 		Generic class all postgres protocol messages/headers/fragments are based on
 
-		We can't pad as the protocol has arbitrarily aligned numerical
+		We can't use padded structures as the protocol has arbitrarily aligned numerical
 		values in the members we might need to access (probably inefficiently).
 
 		The most accessed fields will be the header fields, which are at known positions
@@ -141,31 +150,69 @@ class PGMessageStruct(ctypes.BigEndianStructure):
 		at an offset of sizeof(word) - 1. (This wastes nearly a full word)
 
 		The buffer for unqualified messages starts with the size.
-		
-	"""
 
+		The following class attributes are calculated  on initialization
+		
+		BUFFER_OFFSET:		(int)
+			How far into the structure the actual data starts.
+			Calculated from the _initial_padding_ field
+		
+
+	"""
+	_pack_ = 1
+	_fields_ = []
+	BUFFER_OFFSET = 0
+
+	def __new__(cls):
+		"""
+			We need some default instance members, and those need to be there
+			before the factory uses the object
+		"""
+		out_obj = ctypes.BigEndianStructure.__new__(cls)
+		return out_obj
+
+
+	def __str__(self):
+		""" This makes the  """
+
+		return "%s: %s" % (
+			self.__class__.__name__,
+			{
+				"info": {
+					"total_length": ctypes.sizeof(self),
+					"buffer_offset": self.BUFFER_OFFSET,
+				},
+				"fields": {f_name: self.__getattribute__(f_name) for (f_name, f_val) in self._fields_}
+			}
+			
+		)
+
+	def __repr__(self):
+		return "<%s>" % self.__str__()
 
 class MessageHeader(PGMessageStruct):
 	"""
 		Basic message header class.
-		
+
 		It has no structure of its own, however different header family
 		types can append/prepend/intermingle header fields to this
 	"""
-	_fields_ = []
 	# this indicates how far into the padding the actual header starts
-	PADDING_WIDTH = 0
-	SIGNATURE_SIZE = None
-
 
 
 class InitialMessageHeader(MessageHeader):
 	"""
-		Initial message header has only size (and in most cases that's a lie as
-		it gets usurped with reserved values)
+		Initial message header has size (and in most cases that's a lie as
+		it gets usurped with reserved values) and protocol information,
+		which in most cases is hard coded to some values
 	"""
-	_fields_ = [("length", MessageSize)] + MessageHeader._fields_
-	
+	_fields_ = [
+		("length", MessageSize),
+		("protocol_major", ProtocolVersionMember),
+		("protocol_minor", ProtocolVersionMember),
+	] + MessageHeader._fields_
+
+
 
 class QualifiedMessageHeader(MessageHeader):
 	"""
@@ -173,26 +220,51 @@ class QualifiedMessageHeader(MessageHeader):
 		Note the padding member to align with the word size
 	"""
 	_fields_ = [
-		("_tq_padding_", (MessageTypeQualifier * (CPU_WORD_SIZE - 1))),
+		("_initial_padding_", (MessageTypeQualifier * (CPU_WORD_SIZE - 1))),
 		("qualifier", MessageTypeQualifier)
 	] + InitialMessageHeader._fields_
-	PADDING_WIDTH = ctypes.sizeof(_fields_[0][1])
 
 
-
-class MessagePayload(PGMessageStruct):
+# payload types
+class PaddedMessagePayload(PGMessageStruct):
 	"""
-		Base class for MessagePayload.
-		The default payload is empty
+		This kind of payload is loaded directly into the buffer as the length and
+		its structure can be defined in _fields_ and do not require any parsing.
+
+		These messages require no additional methods to process, but from_bytes
+		is supplied as an alias to from_buffer()
 	"""
-	_fields_ = []
+
+
+class PackedMessagePayload(PGMessageStruct):
+	"""
+		This kind of payload has a dynamic size and structure, and needs some advanced
+		logic to generate and process.
+
+
+		Members of this payload cannot be manipulated in place: a new payload must be
+		generated instead with the from_dict() class member.
+
+		By default, messages of this type are not decoded automatically
+
+		Each instance of this class is also expected a decode_buffer() method,
+		
+
+		Subclasses can override AUTO_DECODE_DEFAULT to True if is desirable that
+		new ins
+	
+
+	"""
+	def from_bytes(cls, data_bytes, offset = 0):
+		raise NotImplementedError("MessagePayload parsing is not implemented for %s" % (self.__class__.__name))
+
+
 
 
 class Message(PGMessageStruct):
-	_fields_ = [
-		("header", MessageHeader),
-		("payload", MessagePayload)
-	]
+	_fields_ = [("header", MessageHeader)]
+	#[("header", MessageHeader), ("payload", MessagePayload)]
+	# by default messages have no payload, but subclasses may specify a payload type
 	"""
 		Messages can be constructed in 2 ways:
 		- traditional constructor:
@@ -204,6 +276,11 @@ class Message(PGMessageStruct):
 					See the class method documentation
 	"""
 	
+	# more helpful static members as nested Structures tend to hide those
+	HEADER_CLASS = tuple(filter(lambda fd : fd[0] == "header", _fields_))[0][1]
+	HEADER_PADDED_LENGTH = ctypes.sizeof(HEADER_CLASS)
+	HEADER_LENGTH = ctypes.sizeof(HEADER_CLASS) - HEADER_CLASS.BUFFER_OFFSET
+
 	# This is the dictionary of states of a given subclass of message is and
 	# all its subclasses in turn are accepted by backends in (it is a
 	# pg_streams.BackEndState). 
@@ -217,41 +294,29 @@ class Message(PGMessageStruct):
 	@classmethod
 	def from_bytes(cls, data_buffer):
 		"""
-			Much like, say, int's from_bytes(), this class method constructs the appropriate
+			Much like, say, int's from_bytes(), constructs the appropriate
 			message type based on the initial chunks of the passed buffer.
-			More specifically, it expects at least the message signature to instantiate the
+			More specifically, it expects at least the message header to instantiate the
 			right class and allocate a buffer of appropriate size.
 
-			Can only be called on generic classes InitialMessage and QualifiedMessage, but not
-			their parent Message class as it is impossible to ascertain if a message has a
+			Can only be called on generic intermediate classes such as InitialMessage and QualifiedMessage,
+			but not their parents as it is impossible to ascertain if a message has a
 			type qualifier or not just by looking at the signature.
 			(InitialMessage message types form a small family of initial legacy messages that
 			unfortunately have no qualifier byte)
-			
+
 			It never actually instatiates from the class it's called from: it returns the
 			appropriate subclass based on what was determined.
 
-			The resulting object always presents properties defined according to what overrides
-			the subclass implement in their members. More specifically:
+
+			_fields_ can be overridden to specify which message type and payload type a message
+			class is supposed to be using. Those classes'/member constructors should
+			just handle the buffer parsing if needed (a lot of message types have statically
+			defined members).
+			More specifically, if the payload is determined to be a structure,
 			
-			HEADER_DEFINITION:		(MessageHeader)
-					Subclasses of ctypes.BigEndianStructure
-					Dictates the size and structure of the message signature.
-					Message type/size inferrance are possible only after enough
-					bytes have been collected to fill this structure
-
-
-			PAYLOAD_DEFINITION:		(MessagePayload)
-					Subclasses of ctypes.BigEndianStructure
-					For messages with a fixed structure, this dictates how the
-					buffer is initialized and properties are mapped.
-					
-					It is dynamically built/altered when callers use the
-					specific generation methods of dynamic message formats
-
-					It is also built based on the incoming data when the
-					message structure is not fixed (eg: nested data)
-
+			its
+			"from bytes"me
 
 			Args:
 				data_buffer:		(bytearray)	The buffer the message must be constructed from.
@@ -268,52 +333,73 @@ class Message(PGMessageStruct):
 
 
 		out_cls = None
+
+		if (len(data_buffer) >= cls.HEADER_LENGTH):
+			# we read the header to decode fields (we already know what the header
+			# format is from the message family)
+			# Of course. Don't forget that the header is padded for qualified messages
+			header_in = cls.HEADER_CLASS()
+			# we assemble an appropriately large header buffer and copy the buffer contents in it.
+			# Unfortunately structure padding forces us to copy memory
+			clr = (ctypes.c_char * (ctypes.sizeof(header_in) - header_in.BUFFER_OFFSET)).from_address(ctypes.addressof(header_in) + header_in.BUFFER_OFFSET)
+			clr.raw = data_buffer[0:cls.HEADER_LENGTH]
+
+
+			# different flows for different message families
+			if (cls is InitialMessage):
+
+				# now we use the "dedicated" protocol version number to identify the
+				# special initial message types. There are so fiew that a lookup
+				# table is not worth it
+				if (isinstance(header_in, InitialMessageHeader)):
+					for special_startup in (CancelRequest, SSLRequest):
+						if ((header_in.protocol_major, header_in.protocol_minor) == special_startup.RESERVED_PROTOCOL_VERSION):
+							out_cls = special_startup
+							break
+
+			else:
+				# QualifiedMessage determination is a simple lookup
+				if (header_in.qualifier not in MESSAGE_QUALIFIERS_CLASSES):
+					raise ValueError("Unknown message type qualifier: %s" % header_in.qualifier)
+
+				out_class = MESSAGE_QUALIFIERS_CLASSES[header_in.qualifier]
+
+
+
+		else:
+			raise ValueError("Magic instantiation of %s requires at least %d bytes of initial data" % (
+				cls.__name__,
+				cls.HEADER_LENGTH
+			))
+
 		
-		print(cls._fields_)
-		print(cls.__dict__)
-		print(cls.header)
-		sys.exit(0)
-		print(cls._fields_["header"])
-
-		sig_size = (ctypes.sizeof(cls.header) - cls.header.PADDING_WIDTH)
-		if (len(data_buffer) < sig_size):
-			raise 
-
-# 		if (len(args) and isinstance(args[0], bytes) and (len(args[0]) >= cls.SIGNATURE_SIZE)):
-# 			start_data = args[0]
-# 		elif (("start_data" in kwargs) and isinstance(args["kwargs"], bytes) and (len(args["kwargs"]) >= cls.SIGNATURE_SIZE)):
-# 			start_data = kwargs["start_data"]
-# 		else:
-# 			raise ValueError("Magic instantiation of %s requires a `bytes` instace at least %d bytes long as the start data" % (
-# 				cls.__name__,
-# 				cls.SIGNATURE_SIZE
-# 			))
-# 			return None
-		
-		# different flows for different message families
-		if (cls is InitialMessage):
-
-			# some message types have a 
-			pass
-
-
 
 
 		if (out_cls is None):
 			raise ValueError("Could not identify a message class to instantiate")
 
-		out_obj = object.__new__(cls)
-		
+		out_obj = out_cls()
+		# We size a buffer based on the intended final message size.
+		# then write what's left of the input data to it, up to the max length
+		out_obj.header = header_in
+
+
+		# how we load the payload depends on the payload type
+
+		# if this subclass has overridden its payload 
+		# Technically, 
+		print(out_obj)
+
 		return out_obj
 
 
-	def __new__(cls):
+	def __new__(cls, *args, **kwargs):
 
 		# a message class can only be directly instantiated if it's not a magic one or above it
 		if (cls in BLACKLISTED_MSG_CLASS_INSTANTIATIONS):
 			raise TypeError("%s cannot be instantiated directly. Please use a subclass" % (cls.__name__))
-			
-		return object.__new__(cls)
+
+		return super().__new__(cls)
 
 
 ################################################################
@@ -324,27 +410,33 @@ class InitialMessage(Message):
 	"""
 		See the parent for the generic overridable class members of Messages.
 		This subclass only describes and defines overrides that apply specifically to it
-		
-			RESERVED_PROTOCOL_VERSION:		(2-tuple)	
+
+			RESERVED_PROTOCOL_VERSION:		(2-tuple).
+				Most of the initial messages are special and usurp the protocol version
+				with a reserved value to identify themselves. (major, minor)
 	"""
 	_fields_ = [
-		("header", InitialMessageHeader),
-		("payload", MessagePayload)
+		("header", InitialMessageHeader)
 	]
 
 	# some of the unqualified message types usurp the protocol version declaration
 	# state their message type instead (eg: CancelRequest).
 	# message types that do.
-	
-	# The packed version is generated at module initialization to speed up lookups
-	RESERVED_PROTOCOL_VERSION = None
-	RESERVED_PROTOCOL_VERSION_PACKED = None
+	RESERVED_PROTOCOL_VERSION = (None, None)
 
 
+class CancelRequest(InitialMessage):
+	RESERVED_PROTOCOL_VERSION = (1234, 5678)
 
 class SSLRequest(InitialMessage):
-	HEADER_DEFINITION = InitialMessageHeader
 	RESERVED_PROTOCOL_VERSION = (1234, 5679)
+
+
+class StartupMessage(InitialMessage):
+	"""
+		This is what starts it all. The only piece of information is the
+		connection string, which needs to be parsed dynamically
+	"""
 
 
 
@@ -365,10 +457,9 @@ class QualifiedMessage(Message):
 				Qualifiers get indexed in MESSAGE_QUALIFIERS_CLASSES at initialization
 	"""
 	_fields_ = [
-		("header", QualifiedMessageHeader),
-		("payload", MessagePayload)
+		("header", QualifiedMessageHeader)
 	]
-	TYPE_QUALIFIER = MessageTypeQualifier(0)
+	TYPE_QUALIFIER = MessageTypeQualifier(b"\x00")
 
 
 
@@ -381,48 +472,79 @@ class Terminate(QualifiedMessage):
 
 
 
-
-# we populate the list of what cannot be instantiated directory
-# (all magic classes and their parents)
-def get_class_ancestors(bl_cls):
-	out_s = set(filter(lambda mc : issubclass(mc, Message), bl_cls.__bases__))
-	for bc in set(out_s):
-		out_s.update(get_class_ancestors(bc))
-	out_s.update((bl_cls,))
-	return out_s
-for mag_class in map(lambda cn : globals()[cn], MAGIC_CLASSES):
-	BLACKLISTED_MSG_CLASS_INSTANTIATIONS.update(set(get_class_ancestors(mag_class)))
-del(get_class_ancestors)
-
-
-# we go through the classes and build a message type qualifier resolver now
-for (name, msg_class) in dict(globals().items()).items():
-	if ((isinstance(msg_class, type)) and issubclass(msg_class, QualifiedMessage) and (msg_class is not QualifiedMessage)):
-		if (msg_class.TYPE_QUALIFIER == QualifiedMessage.TYPE_QUALIFIER):
-			raise AttributeError("Class %s is a subclass of QualifiedMessage but does override its TYPE_QUALIFIER" % (msg_class.__name__))
-		if (len(msg_class.TYPE_QUALIFIER) != 1):
-			raise ValueError("Invalid TYPE_QUALIFIER length for class %s" % (msg_class.__name__))
-
-		# note that we store it as an integer
-		MESSAGE_QUALIFIERS_CLASSES[msg_class.TYPE_QUALIFIER[0]] = msg_class
+def initialize():
+	"""
+		Goes through the classes and build the indexes/utility members/blacklists/whatnot.
+		This needs to happen in multiple passes
+		- Basic PGMessageStruct information: convenience/cache "constant" members about the class itself
+		- Messages: more convenience "constant" members that rely on included classes to be calculated (eg, struct members)
+	"""
+	classes = {}
+	for (s_name, s_class) in dict(globals()).items():
+		if (isinstance(s_class, type) and issubclass(s_class, PGMessageStruct)):
+			classes[s_name] = s_class
 
 
-	# also, we pack some attribute to avoid having to do it at "run-time"
-	if ((isinstance(msg_class, type)) and issubclass(msg_class, InitialMessage)):
-		if (msg_class.RESERVED_PROTOCOL_VERSION is not None):
-			msg_class.RESERVED_PROTOCOL_VERSION_PACKED = b"".join(
-				map(lambda v : v.to_bytes(length = 2, byteorder = "big"), msg_class.RESERVED_PROTOCOL_VERSION)
-			)
+	for (s_name, s_class) in classes.items():
+		# we blacklist all the ancestors of magic classes.
+		for mc in map(lambda cn : globals()[cn], MAGIC_CLASSES):
+			if (issubclass(mc, s_class)):
+				BLACKLISTED_MSG_CLASS_INSTANTIATIONS.add(s_class)
+
+
+		# we check if _initial_padding_ is there and
+		# use it as the offset. If it's not the first member,
+		# we throw
+		f_off = 0
+		for str_m in s_class._fields_:
+			if (str_m[0] == "_initial_padding_"):
+				if (f_off > 0):
+					raise RuntimeError("`_initial_padding_` is not the first member in %s's definition" % (s_name))
+					
+				# note that the buffer offset is ADDED to the pre-existing one
+				s_class.BUFFER_OFFSET += ctypes.sizeof(str_m[1])
+				continue
+			f_off += 1
+
+
+	for (s_name, s_class) in classes.items():
+
+		if (not issubclass(s_class, Message)):
+			continue
+
+
+		# messages classes "inherit" the buffer offset from their header's class
+		# (ctypes.struct doesn't make the type of it's members directly accessible :(
+		for str_m in s_class._fields_:
+			if (str_m[0] == "header"):
+				s_class.BUFFER_OFFSET = str_m[1].BUFFER_OFFSET
+				s_class.HEADER_CLASS = str_m[1]
+				s_class.HEADER_PADDED_LENGTH = ctypes.sizeof(s_class.HEADER_CLASS)
+				s_class.HEADER_LENGTH = (s_class.HEADER_PADDED_LENGTH - s_class.BUFFER_OFFSET)
+
+
+
+		if ((isinstance(s_class, type)) and issubclass(s_class, QualifiedMessage) and (s_class is not QualifiedMessage)):
+			if (s_class.TYPE_QUALIFIER == QualifiedMessage.TYPE_QUALIFIER):
+				raise AttributeError("Class %s is a subclass of QualifiedMessage but does override its TYPE_QUALIFIER" % (s_class.__name__))
+			if (len(s_class.TYPE_QUALIFIER) != 1):
+				raise ValueError("Invalid TYPE_QUALIFIER length for class %s" % (s_class.__name__))
+
+			# note that we store it as an integer
+			MESSAGE_QUALIFIERS_CLASSES[s_class.TYPE_QUALIFIER[0]] = s_class
 
 
 
 
+initialize()
 
-x = InitialMessage.from_bytes("")
+im = bytearray(struct.pack("!LHH", 8, *SSLRequest.RESERVED_PROTOCOL_VERSION))
+x = InitialMessage.from_bytes(im)
 #x = SSLRequest()
 print(type(x))
-print(x.RESERVED_PROTOCOL_VERSION_PACKED)
+print(x)
 
+sys.exit(0)
 
 
 # 	def __new__(cls):
@@ -518,8 +640,6 @@ class MessageDecodeError(Exception):
 
 
 
-
-
 class Message(object):
 	"""
 		Base class all postgres protocol message classes are constructed from.
@@ -607,7 +727,6 @@ class Message(object):
 		# Intermediate, generic subclasses are also factories and their constructor initiates the correct
 		# subclass
 		# This check is done on the class name to avoid having dealing with circular dependencies
-
 
 		cls_name = cls.__name__
 		out_class = cls
