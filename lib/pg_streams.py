@@ -183,7 +183,15 @@ class DownStreamSession(ipc_streams.Stream):
 							expected_message_class = pg_messages.QualifiedMessage
 
 						if (inbox_bc >= expected_message_class.SIGNATURE_SIZE):
-							msgs[box] = expected_message_class.from_buffer(self.mail_boxes[box][0])
+
+							try:
+								msgs[box] = expected_message_class.from_buffer(self.mail_boxes[box][0])
+							except Exception as e_msg:
+								LOGGER.error("Unable to process client message: %s(%s)", e_msg.__class__.__name__, e_msg_)
+								LOGGER.info("Terminating session")
+								self.shutdown()
+								sys.exit(6)
+
 							consumed = len(msgs[box].data)
 					else:
 						# the message already knows how much data it needs,
