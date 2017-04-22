@@ -4,6 +4,7 @@ import logging
 import enum
 import struct
 import random
+import copy
 
 import ipc_streams
 import guc
@@ -309,18 +310,21 @@ class Message(object):
 		"""
 
 		# total INTENDED lenght of the message, excluding the type qualifier
+		# but including the length indicator itself
 		self.length = None
 
 		# the data itself
 		self.data = b""
-
-
+		
+		# we initialize the fields
+		self.fields = copy.deepcopy(self.PAYLOAD_MEMBERS)
 		# we initialize the payload-specific attributes.
 		for pm in self.PAYLOAD_MEMBERS:
-			setattr(self, pm, self.PAYLOAD_MEMBERS[pm])
+			setattr(self, pm, self.fields[pm])
 
 
-		#print("Init of %s completed. Data: %s" % (self.__class__.__name__, start_data))
+
+
 
 
 	@property
@@ -371,6 +375,8 @@ class Message(object):
 			if (not (hasattr(self, "encode_hook") and callable(self.encode_hook))):
 				raise NotImplementedError("encode() has ben called, but %s does not implement encode_hook()" % (self.__class__.__name__))
 			payload = self.encode_hook()
+			if (payload is None):
+				raise ValueError("%s.encode_hook() returned None" % self.__class__.__name__)
 		else:
 			payload = b""
 
@@ -400,7 +406,8 @@ class Message(object):
 
 	def info_str(self):
 		""" Should a specific message choose to add some more info to __str__ and __repr__ it can override this method """
-		return None
+		# the default message for human-readable representation is quite dull
+		return "Payload type has no description renderer"
 
 	def __str__(self):
 		"""
@@ -408,13 +415,13 @@ class Message(object):
 		"""
 		# note that the type qualifier is NOT counted in the size uint of the data
 		info_str = self.info_str()
-		
-		return ("PostgreSQL protocol message: %s[%scomplete, stated size: %s, current_size: %d]%s" % (
+
+		return ("PostgreSQL protocol message: %s[%scomplete, total_size: %s, current_size: %d](%s)" % (
 			self.__class__.__name__,
-			("" if ((len(self.data) - self._qualifier_lenght) == (self.length if (self.length is not None) else -1)) else "in"),
+			("" if ((self.length is not None) and ((len(self.data) - self._qualifier_lenght) == self.length)) else "in"),
 			(str(self.length) if (self.length is not None) else "<unknown>"),
 			len(self.data),
-			("( " + (info_str if (info_str) else "<Payload not described>") + " )")
+			self.info_str()
 		))
 
 	def __repr__(self):
@@ -807,25 +814,90 @@ class RowDescription(QualifiedMessage):
 	}
 	AUTO_DECODE = False
 
+
+
+
 	def __init__(self, initial_fields = ()):
 		"""
 			The constructor accepts a list.
 			We pre-hydrate the "fields" member with that list of FieldDefinitions
 		"""
 		super().__init__()
-		# ugly method proxying
+		# ugly and inefficient method proxying
 		[setattr(self, proxied, getattr(self.fields, proxied)) for proxied in (
 			"append", "insert", "extend", "__iadd__", "__imul__", "pop"
 		)]
 		self.extend(initial_fields)
 
 
+	def encode_hook(self):
+		# Documentation says: column name, a nullchar and all the numerical attributes
+		# packed as follows, the whole thing repeated for each column
 
+		return struct.pack("!h", (len(self.fields))) + b"".join(
+			fld.name.encode() + b"\x00" + struct.pack("!ihihih",
+				fld.rel_oid, fld.att_num, fld.type_oid,
+				fld.type_len, fld.type_mod, fld.format_code
+			) for fld in self.fields
+		)
+
+
+	def decode_hook(self):
+		# this requires some degree of smart parsing
+
+		self.fields.clear() # reboot!
+
+		# first 2 bytes advertise field numbers.
+		fld_num = struct.unpack("!h", self.data[self.SIGNATURE_SIZE:self.SIGNATURE_SIZE + 2])[0]
+
+		if (fld_num < 0):
+			raise MessageDecodeError("The buffer indicates a negative number of fields (%d)" % fld_num)
+		
+		# this definition format is kinda awkward to parse, as for each field we need to look for the
+		# first nullchar (the null terminator of the name), unpack what follows and move the pointer ahead.
+		# This involves more lenght sanity checks than it's healthy.
+		# I'd bet money that the backend itself happily uses sscanf() for this
+
+		next_start = self.SIGNATURE_SIZE + 2 # "pointer" to the beginning of the next field definition
+		for fld_id in range(0, fld_num, 1):
+			name_terminator = self.data.find(b"\x00", next_start)
+			if (name_terminator < 0):
+				raise MessageDecodeError("Could not locate name terminator for field #%d" % fld_id)
+			# we check if there is enough data in the message to unpack this field's attributes. It's 18 bytes
+			# Note that self.lenght is not counting the type qualifer, so we're off by 1
+			if ((self.length - name_terminator) < 18):
+				raise MessageDecodeError("Not enough numeric attribute bytes after the name at field #%d" % fld_id)
+
+			# we also test encoding compliance explicitly
+			try:
+				name_decoded = self.data[next_start:name_terminator].decode()
+			except Exception as e_decode:
+				raise MessageDecodeError("Unable to decode name string at field #%d - %s(%s)" % (fld_id, e_decode.__class__.__name__, e_decode))
+
+			# time to pick up the pieces
+			#print(self.data[name_terminator + 1:name_terminator + 19])
+			num_f = struct.unpack("!ihihih", self.data[name_terminator + 1:name_terminator + 19])
+			self.append(pg_data.FieldDefinition(name = name_decoded,
+				rel_oid = num_f[0], att_num = num_f[1],	type_oid = num_f[2],
+				type_len = num_f[3], type_mod = num_f[4], format_code = num_f[5]
+			))
+
+			next_start = name_terminator + 19
+
+		if (next_start < (self.length + 1)): # remember we're off by one
+			raise MessageDecodeError("Trailing garbage bytes in row description message")
+
+
+		return True
+
+	def info_str(self):
+		# We let the data class do the heavy lifting here
+		return str(self.fields)
 
 
 ################################################################
 ################################################################
-### MODULE INITIALIZATION
+### MODULE INITIALIZATION/Monkey patching
 ################################################################
 ################################################################
 
@@ -860,5 +932,4 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 			msg_class.RESERVED_PROTOCOL_VERSION_PACKED = b"".join(
 				map(lambda v : v.to_bytes(length = 2, byteorder = "big"), msg_class.RESERVED_PROTOCOL_VERSION)
 			)
-
 

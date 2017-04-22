@@ -11,8 +11,11 @@ in the postgresql frontend-backend protocol.
 
 Technically these are message fragments
 
-"""
 
+Although that would work, this system is not meant to decode the in-line protocol
+traffic but to easily generate/accept records for/to the management SQL interface
+
+"""
 
 class FieldDefinition():
 	"""
@@ -44,7 +47,7 @@ class FieldDefinition():
 		[setattr(self, arg_in, sl[arg_in]) for arg_in in sl.keys()]
 
 	def __str__(self):
-		return "Field(name = `%s`, rel_oid = %d, att_num = %d, type_oid = %d, type_len = %d, type_mod = %d, format_code = %d)" % (
+		return "name = `%s`, rel_oid = %d, att_num = %d, type_oid = %d, type_len = %d, type_mod = %d, format_code = %d" % (
 			self.name, self.rel_oid, self.att_num, self.type_oid, self.type_len,
 			self.type_mod, self.format_code
 		)
@@ -92,7 +95,7 @@ class RowDefinition(list):
 		return super().__iadd__(value)
 
 	def __str__(self):
-		return "[%s]" % ",".join(map(str, self))
+		return "%d columns(%s)" % (len(self), "), (".join(map(str, self)))
 
 	def __repr__(self):
 		return "< %s >" % self.__str__()
