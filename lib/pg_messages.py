@@ -30,9 +30,13 @@ integers
 
 
 
+At the moment, encoding is always assumed to be UTF8, but that will be easy to change
+later as str.encode() accepts an argument
 
 
-A lot of refactoring is called for, primarily for performance reasons:
+
+
+A lot of refactoring may be called for, primarily for performance reasons:
 
 
 # this is how we can address this issue efficiently:
@@ -303,6 +307,7 @@ class Message(object):
 
 		return out_obj
 
+	from_bytes = from_buffer
 
 	def __init__(self):
 		"""
@@ -796,8 +801,7 @@ class DataRow(QualifiedMessage):
 
 		When created off a buffer, there is no validation.
 
-		During encoding, anything that is not a scalar is cast to its text representation,
-		and throws an exception if that is longer than the size declaration
+		During encoding, anything that is not a scalar is cast to its string representation
 
 		Rows are immutable
 	"""
@@ -809,10 +813,41 @@ class DataRow(QualifiedMessage):
 	}
 	AUTO_DECODE = False
 
+
 	def __init__(self, fields):
-		
 		self.fields = initial_fields
 
+
+	def encode(self):
+		"""
+			Accepts a python variables and, depending on type, packs it whatever
+			can be interpreted as its string representation
+			(from __bytes__, __str__, and __repr__, respectively).
+
+			NOTE: for int and float, it uses the machine's native word size,
+			which is a gamble as on, say, an int always turns into the binary
+			representation of a 8-bytes int on 64 bit.
+
+			Implemented as an additional
+			
+			Args:
+				value:		the value to pack
+			
+			Return:
+				the protocol-packed value
+		"""
+
+		out_cells = []
+		for cell in self.field:
+			# we first look for a viable packer
+			for tp in pg_data.TYPE_PACKERS:
+				if (isinstance(cell, tp)):
+					out_cell = tp.pack(cell)
+					out_cell
+		
+		pack_str = None
+		
+		
 
 
 
@@ -821,9 +856,9 @@ class RowDescription(QualifiedMessage):
 		Relatively complex message type, mostly because one of the fields is
 		variable-lenght (the field name).
 
-		Could probably be implemented with secondary inheritance from pg_data.RowDefinition,
+		Could probably be implemented with a secondary inheritance from pg_data.RowDefinition,
 		but we'd still have to maintain "fields" manually, so we proxy some of the
-		methods under different names
+		methods in a protected fashion (to stop 
 
 		The constructor allows for an iterable of fields to be passed. EG:
 
@@ -982,7 +1017,3 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 
 
 
-
-x = DataRow()
-
-x.encode()
