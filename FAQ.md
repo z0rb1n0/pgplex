@@ -9,11 +9,10 @@ It all started after some frustration over the implementation of other pooling/c
 
 Nowadays we only use C or other low-level languages for stuff such as fast packet sniffing or the like, and more often that not that is driven by language affinity to te POSIX API as opposed to speed requirements.
 
-To boot pgplex, unlike postgres itself, does not do much in-memory heavy lifting as is mostly about bookkeeping of processes and connections; in fact there are no big tight loops and we're rather confident that performance is going to be largely dominated by IPC system calls.
+To boot pgplex, unlike postgres itself, does not do much in-process heavy lifting as is mostly about bookkeeping of processes and connections; in fact there are no big tight loops and we're rather confident that performance is going to be largely dominated by IPC system calls.
 
 I believe Python and its standard modules (many of them we can/do sidestep to save on overhead) generally offer more than enough optimization tools for whatever edge cases we could encounter, and nothing would stop us from writing a custom module if need be.
 
 On the other hand an highly expressive language allows for a far more maintaniable and therefore bug-free implementation, especially in asmall community
-
 
 ---

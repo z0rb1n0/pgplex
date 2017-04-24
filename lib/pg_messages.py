@@ -313,18 +313,15 @@ class Message(object):
 		# but including the length indicator itself
 		self.length = None
 
-		# the data itself
+		# the data itself, including everything, even the eventual type qualifier which
+		# is NOT counted in "length"
 		self.data = b""
-		
+
 		# we initialize the fields
 		self.fields = copy.deepcopy(self.PAYLOAD_MEMBERS)
 		# we initialize the payload-specific attributes.
 		for pm in self.PAYLOAD_MEMBERS:
 			setattr(self, pm, self.fields[pm])
-
-
-
-
 
 
 	@property
@@ -352,8 +349,9 @@ class Message(object):
 
 		# time to really append however much data is missing.
 		# Catch: the intended length is 1 short for qualified messages
+		# This is possibly the most expensive operation in the entire class and
+		# it'd make sense to look in some memoryview() trickery to make it better
 		self.data += newdata[0:((self.length + self._qualifier_lenght) - len(self.data))]
-
 
 		if (self.AUTO_DECODE and self.length and (not self.missing_bytes)):
 			self.decode()
@@ -788,16 +786,45 @@ class Query(QualifiedMessage):
 		return self.query.replace(b"\x10", b"\x10\x10").decode()[0:32]
 
 
+class DataRow(QualifiedMessage):
+	"""
+		One of these is sent off to the frontend for each data row in a set.
+		It's always better not to instantiate these directly as mistakes here
+		likely translate in protocol violations. Better to use RowDescription's
+		add/delete row methods and "render" records through the parent's RowDescription
+		object (see its definition)
+
+		When created off a buffer, there is no validation.
+
+		During encoding, anything that is not a scalar is cast to its text representation,
+		and throws an exception if that is longer than the size declaration
+
+		Rows are immutable
+	"""
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"D"
+	# the "fields" is just an instance of the row description, empty by default
+	PAYLOAD_MEMBERS = {
+		"fields": ()
+	}
+	AUTO_DECODE = False
+
+	def __init__(self, fields):
+		
+		self.fields = initial_fields
+
+
+
 
 class RowDescription(QualifiedMessage):
 	"""
 		Relatively complex message type, mostly because one of the fields is
 		variable-lenght (the field name).
-		
+
 		Could probably be implemented with secondary inheritance from pg_data.RowDefinition,
 		but we'd still have to maintain "fields" manually, so we proxy some of the
 		methods under different names
-		
+
 		The constructor allows for an iterable of fields to be passed. EG:
 
 			rd = RowDescription([
@@ -813,7 +840,6 @@ class RowDescription(QualifiedMessage):
 		"fields": pg_data.RowDefinition()
 	}
 	AUTO_DECODE = False
-
 
 
 
@@ -887,12 +913,33 @@ class RowDescription(QualifiedMessage):
 		if (next_start < (self.length + 1)): # remember we're off by one
 			raise MessageDecodeError("Trailing garbage bytes in row description message")
 
-
 		return True
 
 	def info_str(self):
 		# We let the data class do the heavy lifting here
 		return str(self.fields)
+
+	def create_row(self, values = ()):
+		"""
+			Row formatting function. Simply expects an iterable of values.
+			The supported input types for each member are None, bool, int, float, str, byte[array].
+			They're translated into the closest approximation of an on-the-wire type representation
+			that is defined in the row definition.
+
+			Args:
+				values:			an iterable of the values.
+								The wrong number of members for this RowDefinition or any member that
+								cannot be cast to the matching FieldDefinition cause an exception
+			
+			Return:
+				a DataRow instance
+
+		"""
+		pass
+
+
+
+
 
 
 ################################################################
@@ -914,7 +961,7 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 				msg_class._qualifier_lenght = 1
 				if (hasattr(msg_class, "ALLOWED_RECIPIENTS")):
 					if (not hasattr(msg_class, "TYPE_QUALIFIER")):
-						raise AttributeError("Class %s is a subclass of QualifiedMessage which is active by defining ALLOWED_RECIPIENTS but does not define its TYPE_QUALIFIER member (bust be a single byte)" % (msg_class.__name__))
+						raise AttributeError("Class %s is a subclass of QualifiedMessage which is active by defining ALLOWED_RECIPIENTS but does not define its TYPE_QUALIFIER member (must be a single byte)" % (msg_class.__name__))
 
 					if (len(msg_class.TYPE_QUALIFIER) != 1):
 						raise ValueError("Invalid TYPE_QUALIFIER lenght for class %s" % (msg_class.__name__))
@@ -933,3 +980,9 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 				map(lambda v : v.to_bytes(length = 2, byteorder = "big"), msg_class.RESERVED_PROTOCOL_VERSION)
 			)
 
+
+
+
+x = DataRow()
+
+x.encode()
