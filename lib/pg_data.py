@@ -329,58 +329,6 @@ class PGBytea(PGType, bytes):
 
 
 
-class FieldDefinition():
-	"""
-		Helper class to properly describe the attributes of a data field, as
-		understood by the protocol (see the RowDescription message type at
-		https://www.postgresql.org/docs/current/static/protocol-message-formats.html )
-
-		Differences from the format described in the document are that the type is
-		a reference to a subclass of PGType and that the type length is not specified as
-		it is dictated by the referenced class (it's -1 if the class does not have a packer
-		structure)
-	"""
-
-
-	def __init__(self,
-		name,
-		data_type,
-		rel_oid = 0,
-		att_num = 0,
-		type_mod = 0,
-		binary = False
-	):
-		"""
-			A very simple constructor that hydrates the members. See the document
-			referenced in the class docstring for their definitions.
-
-			All arguments straight-out turn into members.
-
-			Note that the defaults pretty much specify what you'd get with "unknown"
-		"""
-
-		# any defined argument here becomes a member
-		sl = locals().copy()
-		if (not issubclass(data_type, PGType)):
-			raise TypeError("%s is not a subclass of PGType" % pg_type.__name__)
-
-		[setattr(self, arg_in, sl[arg_in]) for arg_in in sl.keys()]
-
-	def __str__(self):
-		return "name = `%s`, type = %s(OID: %d, %s), rel_oid = %d, att_num = %d, type_mod = %d, encoded as %s" % (
-			self.name,
-			self.data_type.__name__,
-			self.data_type.oid,
-			("%d bytes" % self.data_type.length) if (self.data_type.length is not None) else "variable size",
-			self.rel_oid,
-			self.att_num,
-			self.type_mod,
-			"binary" if self.binary else "text"
-		)
-
-	def __repr__(self):
-		return "< %s(%s) >" % (self.__class__.__name__, self.__str__())
-
 
 
 
