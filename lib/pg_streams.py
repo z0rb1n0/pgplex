@@ -351,7 +351,7 @@ class DownStreamSession(ipc_streams.Stream):
 
 
 
-					enc = self.client_supplied_defaults["client_encoding"].decode() if "client_encoding" in self.client_supplied_defaults else "UTF8"
+					enc = self.client_supplied_defaults["client_encoding"] if "client_encoding" in self.client_supplied_defaults else "UTF8"
 
 					for (par, val) in (
 						("server_encoding", enc),
@@ -359,8 +359,8 @@ class DownStreamSession(ipc_streams.Stream):
 						("DateStyle", "ISO")
 					):
 						parm = pg_messages.ParameterStatus()
-						parm.parameter = par.encode()
-						parm.value = val.encode()
+						parm.parameter = par
+						parm.value = val
 						parm.encode()
 						self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = parm)
 
@@ -376,12 +376,12 @@ class DownStreamSession(ipc_streams.Stream):
 
 				elif (isinstance(msg, pg_messages.Query)):
 
+					msg.decode()
 					self.state = pg_messages.SessionState.Active
-
 					bartek = pg_messages.ErrorResponse()
-					bartek.messages.append((b"C", b"XX000"))
-					bartek.messages.append((b"M", b"Nothing is implemented yet"))
-					bartek.messages.append((b"H", b"Time to get off your ass and help Fabio with commits. Glory awaits :-)"))
+					bartek.messages.append(("C", "XX000"))
+					bartek.messages.append(("M", "Nothing is implemented yet"))
+					bartek.messages.append(("H", "Time to get off your ass and help Fabio with commits. Glory awaits :-)"))
 					bartek.encode()
 					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = bartek)
 

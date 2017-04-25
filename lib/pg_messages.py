@@ -68,10 +68,11 @@ msg.payload = b"hello"
 print(buf)
 
 
-
-
-
 """
+
+
+
+
 
 
 # this is a quick lookup table that resolves message qualifiers into the
@@ -241,6 +242,10 @@ class Message(object):
 	# the value in the definition itself.
 	PAYLOAD_MEMBERS = {}
 
+
+	# some packers are better compiled
+	_LENGTH_PACKER = struct.Struct("!i")
+
 	@classmethod
 	def from_buffer(cls, start_data):
 		"""
@@ -309,6 +314,17 @@ class Message(object):
 
 	from_bytes = from_buffer
 
+
+	def reset_fields(self):
+		"""
+			Resets the "fields" attribute to the value if PAYLOAD_MEMBERS
+		"""
+		# we initialize the fields
+		self.fields = copy.deepcopy(self.PAYLOAD_MEMBERS)
+		# we initialize the payload-specific attributes.
+		for pm in self.PAYLOAD_MEMBERS:
+			setattr(self, pm, self.fields[pm])
+
 	def __init__(self):
 		"""
 			The message itself can be initialized empty
@@ -322,11 +338,7 @@ class Message(object):
 		# is NOT counted in "length"
 		self.data = b""
 
-		# we initialize the fields
-		self.fields = copy.deepcopy(self.PAYLOAD_MEMBERS)
-		# we initialize the payload-specific attributes.
-		for pm in self.PAYLOAD_MEMBERS:
-			setattr(self, pm, self.fields[pm])
+		self.reset_fields()
 
 
 	@property
@@ -350,7 +362,7 @@ class Message(object):
 				# between our previous buffer and the new data we've got enough bytes
 				# It's a little tricky as we're potentially operating across 2 strings
 				# (the previously buffered data)
-				(self.length,) = struct.unpack("!i", (self.data + newdata[0:(self.SIGNATURE_SIZE - len(self.data))])[(self.SIGNATURE_SIZE - 4):])
+				(self.length,) = self._LENGTH_PACKER.unpack((self.data + newdata[0:(self.SIGNATURE_SIZE - len(self.data))])[(self.SIGNATURE_SIZE - self._LENGTH_PACKER.size):])
 
 		# time to really append however much data is missing.
 		# Catch: the intended length is 1 short for qualified messages
@@ -383,8 +395,8 @@ class Message(object):
 		else:
 			payload = b""
 
-		self.length = 4 + len(payload)
-		self.data = (self.TYPE_QUALIFIER if self._qualifier_lenght else b"") + struct.pack("!i", self.length) + payload
+		self.length = self._LENGTH_PACKER.size + len(payload)
+		self.data = (self.TYPE_QUALIFIER if self._qualifier_lenght else b"") + self._LENGTH_PACKER.pack(self.length) + payload
 
 
 	def decode(self):
@@ -392,13 +404,17 @@ class Message(object):
 			Wrapper for the actual subclass-controlled decoder.
 		"""
 
+		# we reset it all
+		self.reset_fields()
+		
+
 		if ((not self.length) or self.missing_bytes):
 			raise ValueError("The message data buffer is %s" % ("empty" if (not self.length) else ("missing %d bytes" % self.missing_bytes)))
 
 		# decode hook is not needed if the message is just its signature
 		if (self.PAYLOAD_MEMBERS):
-			if (not hasattr(self, "decode_hook") and callable(self.decode_hook)):
-				raise NotImplementedError("decode() has ben called, but %s does not implement decode_hook()" % (self.__class__.__name__))
+			if (not (hasattr(self, "decode_hook") and callable(self.decode_hook))):
+				raise NotImplementedError("decode() has ben called, but %s does not implement a callable decode_hook()" % (self.__class__.__name__))
 
 			return self.decode_hook()
 		else:
@@ -469,20 +485,38 @@ class StartupMessage(InitialMessage):
 	AUTO_DECODE = True
 
 
+	_PROTOCOL_VERSION_PACKER = struct.Struct("!hh")
+
 	def decode_hook(self):
 		""" Just extracts version information """
-		(self.protocol_major, self.protocol_minor) = struct.unpack("!hh", (self.data[4:6] + self.data[6:8]))
+		(self.protocol_major, self.protocol_minor) = self._PROTOCOL_VERSION_PACKER.unpack(
+			self.data[self._LENGTH_PACKER.size:self._LENGTH_PACKER.size + self._PROTOCOL_VERSION_PACKER.size]
+		)
 
-		# we break the connection string into pieces
+		# we break the connection string into pieces, and decode the contents
 		opt_n = None
-		for cnn_opt_w in self.data[8:-1].split(b"\x00"):
+		for cnn_opt_w in self.data[self._LENGTH_PACKER.size + self._PROTOCOL_VERSION_PACKER.size:-1].split(b"\x00"):
 			if (opt_n is None):
-				opt_n = cnn_opt_w
+				opt_n = cnn_opt_w.decode()
 			else:
-				self.options[opt_n] = cnn_opt_w
+				self.options[opt_n] = cnn_opt_w.decode()
 				opt_n = None
 
 		return True
+
+
+	def encode_hook(self):
+		""" Wrap this up. Absolutely untested """
+		if (not (self.protocol_major and self.protocol_minor)):
+			raise MessageEncodeError("Both protocol_major and protocol_minor must be set")
+
+		# we just stick everything together
+		return (
+			self._PROTOCOL_VERSION_PACKER.pack(self.protocol_major, self.protocol_minor)
+		+
+			b"\x00".join((ok.encode() + b"\x00" + ov.decode() for (ok, ov) in self.options.items())) + (b"\x00" * 2)
+		)
+
 
 	def info_str(self):
 		if ((self.protocol_major and self.protocol_minor) is not None):
@@ -574,14 +608,14 @@ class ResponseToUser(QualifiedMessage):
 		PeerType.FrontEnd: (SessionState.WaitingForResultState,)
 	}
 	def decode_hook(self):
-		self.messages = [(ml[:1], ml[1:]) for ml in self.data[self.SIGNATURE_SIZE:-1].split(b"\x00\x00")]
+		self.messages = [(ml[:1].decode(), ml[1:].decode()) for ml in self.data[self.SIGNATURE_SIZE:-1].split(b"\x00\x00")]
 
 		return True
 
 	def encode_hook(self):
 		if (not len(self.messages)):
 			raise MessageEncodeError("There are no message strings")
-		return b"\x00".join(((mh + mb) for (mh, mb) in self.messages)) + b"\x00\x00"
+		return b"\x00".join(((mh.encode() + mb.encode()) for (mh, mb) in self.messages)) + b"\x00\x00"
 	
 	def info_str(self):
 		return "%s" % (self.messages,)
@@ -615,6 +649,10 @@ class Authentication(QualifiedMessage):
 	}
 	AUTO_DECODE = True
 
+	
+	_AUTH_MODE_PACKER = struct.Struct("!i")
+	_SALT_PACKER = struct.Struct("!i")
+
 	def encode_hook(self):
 		
 		if (self.mode is None):
@@ -626,18 +664,48 @@ class Authentication(QualifiedMessage):
 
 		if ((self.mode == AuthenticationMode.GSSContinue) and (self.gss_sspi_data is None)):
 			raise(MessageEncodeError("GSSAPI/SPI authentication data is required"))
-		
-		out_str = struct.pack("!i", self.mode)
+
+		out_str = self._AUTH_MODE_PACKER.pack(self.mode)
 		
 		if (self.mode == AuthenticationMode.MD5Password):
-			out_str += struct.pack("!i", self.salt)
+			out_str += self._SALT_PACKER.pack(self.salt)
 		elif (self.mode == AuthenticationMode.GSSContinue):
 			out_str += self.gss_sspi_data
 
 		return out_str
 
+	# todo: decode hook for the backend-facing side
+	def decode_hook(self):
 
-	# todo: decode hook for the backend side
+		self.mode = self._AUTH_MODE_PACKER.unpack(self.data[self.SIGNATURE_SIZE:self.SIGNATURE_SIZE + self._AUTH_MODE_PACKER.size])[0]
+
+		# we assume that GSS SSPI will always be at least 4 bytes
+		min_size = (self.SIGNATURE_SIZE + self._AUTH_MODE_PACKER.size + 4)
+
+		if (self.length < min_size):
+			raise MessageDecodeError("Insufficient message size for Authentication (must be at least %d, is %d)" %
+				min_size,
+				self._LENGTH_PACKER.size + self.length
+			)
+
+		data_start = self.SIGNATURE_SIZE + self._AUTH_MODE_PACKER.size
+
+		if (self.mode == AuthenticationMode.MD5Password):
+			expected_size = self.SIGNATURE_SIZE.size + self._AUTH_MODE_PACKER.size + self._SALT_PACKER.size
+			if (self.length != expected_size):
+				raise MessageDecodeError("Wrong message size for MS5 authentication (must be %d, is %d)" % (
+					expected_size,
+					self._LENGTH_PACKER.size + self.length
+				))
+
+			self.salt = self._SALT_PACKER.unpack(self.data[data_start:data_start + self._SALT_PACKER.size])[0]
+
+		elif (self.mode == AuthenticationMode.GSSContinue):
+			self.gss_sspi_data = self.data[data_start:]
+		else:
+			raise MessageDecodeError("Unknown authentication mode: %d" % mode)
+		return True
+
 
 	def info_str(self):
 	
@@ -663,13 +731,13 @@ class Password(QualifiedMessage):
 
 	AUTO_DECODE = True
 	def decode_hook(self):
-		self.password = self.data[self.SIGNATURE_SIZE:-1]
+		self.password = self.data[self.SIGNATURE_SIZE:-1].decode()
 		return True
 
 	def encode_hook(self):
 		if (not isinstance(self.password, bytes)):
 			raise MessageEncodeError("Password property is not set/invalid")
-		return self.password
+		return self.password.encode()
 
 
 	def info_str(self):
@@ -688,17 +756,20 @@ class BackendKeyData(QualifiedMessage):
 	}
 
 	AUTO_DECODE = True
+	
+	_PID_PACKER = struct.Struct("!i")
+
 
 	def decode_hook(self):
-		(self.backend_pid) = struct.unpack("!i", self.data[self.SIGNATURE_SIZE:4])
-		self.secret_key = self.data[self.SIGNATURE_SIZE + 4:4]
+		(self.backend_pid) = self._PID_PACKER.unpack(self.data[self.SIGNATURE_SIZE:self._PID_PACKER.size])
+		self.secret_key = self.data[self.SIGNATURE_SIZE + self._PID_PACKER.size:self.SIGNATURE_SIZE + self._PID_PACKER.size + self._SECRET_KEY_PACKER.size]
 		return True
 
 	def encode_hook(self):
-		return struct.pack("!i", self.backend_pid) + self.secret_key
+		return self._PID_PACKER.pack(self.backend_pid) + self.secret_key
 
 	def info_str(self):
-		return "process ID: %d, secret key: `%s`" % (self.backend_pid, self.secret_key)
+		return "process ID: %d, secret key: 0x%s" % (self.backend_pid, self.secret_key.hex())
 
 
 
@@ -751,12 +822,11 @@ class ParameterStatus(QualifiedMessage):
 	AUTO_DECODE = True
 
 	def decode_hook(self):
-		(self.parameter, self.value) = self.data[self.SIGNATURE_SIZE:-1].split(b"\x00")
+		(self.parameter, self.value) = (ps.decode() for ps in self.data[self.SIGNATURE_SIZE:-1].split(b"\x00"))
 		return True
 
-
 	def encode_hook(self):
-		return b"\x00".join((self.parameter, self.value)) + b"\x00"
+		return b"\x00".join((ps.encode() for ps in (self.parameter, self.value))) + b"\x00"
 		return True
 
 	def info_str(self):
@@ -779,81 +849,124 @@ class Query(QualifiedMessage):
 
 	AUTO_DECODE = False
 	def decode_hook(self):
-		self.query = self.data[self.SIGNATURE_SIZE:-1]
+		self.query = self.data[self.SIGNATURE_SIZE:-1].decode()
 		return True
 
 	def encode_hook(self):
-		if (not isinstance(self.query, bytes)):
+		if (self.query is None):
 			raise MessageEncodeError("Query is not set")
-		return self.password
+		return self.query.encode()
 
 	def info_str(self):
-		return self.query.replace(b"\x10", b"\x10\x10").decode()[0:32]
+		return self.query.replace("\\n", "\\\\n")[0:32] if (self.query is not None) else "/* no query */"
 
 
-class DataRow(QualifiedMessage):
+
+
+
+class FieldDefinition():
 	"""
-		One of these is sent off to the frontend for each data row in a set.
-		It's always better not to instantiate these directly as mistakes here
-		likely translate in protocol violations. Better to use RowDescription's
-		add/delete row methods and "render" records through the parent's RowDescription
-		object (see its definition)
+		Helper class to properly describe the attributes of a data field, as
+		understood by the protocol (see the RowDescription message type at
+		https://www.postgresql.org/docs/current/static/protocol-message-formats.html )
 
-		When created off a buffer, there is no validation.
-
-		During encoding, anything that is not a scalar is cast to its string representation
-
-		Rows are immutable
+		Differences from the format described in the document are that the type is
+		a reference to a subclass of PGType and that the type length is not specified as
+		it is dictated by the referenced class (it's -1 if the class does not have a packer
+		structure)
 	"""
-	ALLOWED_RECIPIENTS = PeerType.FrontEnd
-	TYPE_QUALIFIER = b"D"
-	# the "fields" is just an instance of the row description, empty by default
-	PAYLOAD_MEMBERS = {
-		"fields": ()
-	}
-	AUTO_DECODE = False
+	
+	# the following only packs the numerical attributes, as the name is variable-length
+	packer = struct.Struct("!ihihih")
 
-
-	def __init__(self, fields):
-		self.fields = initial_fields
-
-
-	def encode(self):
+	def __init__(self,
+		name,
+		data_type,
+		rel_oid = 0,
+		att_num = 0,
+		type_mod = 0,
+		is_binary = False
+	):
 		"""
-			Accepts a python variables and, depending on type, packs it whatever
-			can be interpreted as its string representation
-			(from __bytes__, __str__, and __repr__, respectively).
+			A very simple constructor that hydrates the members. See the document
+			referenced in the class docstring for their definitions.
 
-			NOTE: for int and float, it uses the machine's native word size,
-			which is a gamble as on, say, an int always turns into the binary
-			representation of a 8-bytes int on 64 bit.
+			All arguments straight-out turn into members.
 
-			Implemented as an additional
-			
-			Args:
-				value:		the value to pack
-			
-			Return:
-				the protocol-packed value
+			Note that the defaults pretty much specify what you'd get with "unknown"
 		"""
 
-		out_cells = []
-		for cell in self.field:
-			# we first look for a viable packer
-			for tp in pg_data.TYPE_PACKERS:
-				if (isinstance(cell, tp)):
-					out_cell = tp.pack(cell)
-					out_cell
+		# any defined argument here becomes a member
+		sl = locals().copy()
+		if (not issubclass(data_type, pg_data.PGType)):
+			raise TypeError("%s is not a subclass of PGType" % pg_type.__name__)
+
+		[setattr(self, arg_in, sl[arg_in]) for arg_in in sl.keys()]
+
+
+	@classmethod
+	def from_buffer(cls, buffer):
+		"""
+			Decodes a field definition from a buffer.
+			This definition format is kinda awkward to parse, as each field begins with a variable
+			length string followed by packed values
+		"""
+		nullchar_offset = buffer.find(b"\x00")
+		if (nullchar_offset < 0):
+			raise MessageDecodeError("Field definition contains no nullchar")
+		elif (nullchar_offset == 0):
+			raise MessageDecodeError("Field name has no length")
+
+		if ((len(buffer) - (nullchar_offset + 1)) != cls.packer.size):
+			raise MessageDecodeError("Wrong number of packed values after nullchar")
+
+		try:
+			f_name = buffer[0:nullchar_offset].decode()
+		except Exception as e_decode:
+			raise ValueError("Error while decoding field name: %s(%s)" % (e_decode.__class__.__name__, e_decode))
+
+		(reloid, attnum, typoid, typsize, typmod, isbinary) = cls.packer.unpack(buffer[nullchar_offset + 1:])
+
+		if (typoid not in pg_data.OID_CLASSES):
+			raise TypeError("Unknown type oid: %d" % typoid)
 		
-		pack_str = None
-		
-		
+		return cls(
+			name = f_name,
+			data_type = pg_data.OID_CLASSES[typoid],
+			rel_oid = reloid,
+			att_num = attnum,
+			type_mod = typmod,
+			is_binary = bool(isbinary)
+		)
+
+
+	def __bytes__(self):
+		""" Converts to the network representation """
+		return self.name.encode() + b"\00" + self.packer.pack(
+			self.rel_oid, self.att_num, self.data_type.oid,
+			self.data_type.length, self.type_mod, int(self.is_binary)
+		)
+
+	def __str__(self):
+		return "name = `%s`, type = %s(OID: %d, %s), rel_oid = %d, att_num = %d, type_mod = %d, encoded as %s" % (
+			self.name,
+			self.data_type.__name__,
+			self.data_type.oid,
+			("%d bytes" % self.data_type.length) if (self.data_type.length is not None) else "variable size",
+			self.rel_oid,
+			self.att_num,
+			self.type_mod,
+			"binary" if self.is_binary else "text"
+		)
+
+	def __repr__(self):
+		return "< %s(%s) >" % (self.__class__.__name__, self.__str__())
 
 
 
 class RowDescription(QualifiedMessage):
 	"""
-		Relatively complex message type, mostly because one of the fields is
+		Relatively complex message type, mostly because one the fields is
 		variable-lenght (the field name).
 
 		Could probably be implemented with a secondary inheritance from pg_data.RowDefinition,
@@ -863,8 +976,8 @@ class RowDescription(QualifiedMessage):
 		The constructor allows for an iterable of fields to be passed. EG:
 
 			rd = RowDescription([
-				pg_data.FieldDefinition(name = "foo"),
-				pg_data.FieldDefinition(name = "bar", type_len = 1234)
+				FieldDefinition(name = "foo"),
+				FieldDefinition(name = "bar", data_type = PGBool)
 			])
 
 	"""
@@ -872,44 +985,38 @@ class RowDescription(QualifiedMessage):
 	TYPE_QUALIFIER = b"T"
 	# the "fields" is just an instance of the row description, empty by default
 	PAYLOAD_MEMBERS = {
-		"fields": pg_data.RowDefinition()
+		"data_fields": []
 	}
 	AUTO_DECODE = False
 
+	_FIELD_NUM_PACKER = struct.Struct("!h")
 
 
-	def __init__(self, initial_fields = ()):
+	def __init__(self, field_definitions):
 		"""
-			The constructor accepts a list.
+			The constructor accepts a RowDefinition type, which is immutable
 			We pre-hydrate the "fields" member with that list of FieldDefinitions
 		"""
 		super().__init__()
-		# ugly and inefficient method proxying
-		[setattr(self, proxied, getattr(self.fields, proxied)) for proxied in (
-			"append", "insert", "extend", "__iadd__", "__imul__", "pop"
-		)]
-		self.extend(initial_fields)
+		self.data_fields.extend(field_definitions)
+		
 
-
+		
 	def encode_hook(self):
 		# Documentation says: column name, a nullchar and all the numerical attributes
 		# packed as follows, the whole thing repeated for each column
 
-		return struct.pack("!h", (len(self.fields))) + b"".join(
-			fld.name.encode() + b"\x00" + struct.pack("!ihihih",
-				fld.rel_oid, fld.att_num, fld.type_oid,
-				fld.type_len, fld.type_mod, fld.format_code
-			) for fld in self.fields
+		return self._FIELD_NUM_PACKER.pack(len(self.data_fields)) + b"".join(
+			bytes(fld) for fld in self.data_fields
 		)
 
 
 	def decode_hook(self):
 		# this requires some degree of smart parsing
 
-		self.fields.clear() # reboot!
 
 		# first 2 bytes advertise field numbers.
-		fld_num = struct.unpack("!h", self.data[self.SIGNATURE_SIZE:self.SIGNATURE_SIZE + 2])[0]
+		fld_num = self._FIELD_NUM_PACKER.unpack(self.data[self.SIGNATURE_SIZE:self.SIGNATURE_SIZE + 2])[0]
 
 		if (fld_num < 0):
 			raise MessageDecodeError("The buffer indicates a negative number of fields (%d)" % fld_num)
@@ -919,40 +1026,36 @@ class RowDescription(QualifiedMessage):
 		# This involves more lenght sanity checks than it's healthy.
 		# I'd bet money that the backend itself happily uses sscanf() for this
 
-		next_start = self.SIGNATURE_SIZE + 2 # "pointer" to the beginning of the next field definition
+		total_length = len(self.data)
+		fld_start = self.SIGNATURE_SIZE + 2 # "pointer" to the beginning of the next field definition
 		for fld_id in range(0, fld_num, 1):
-			name_terminator = self.data.find(b"\x00", next_start)
-			if (name_terminator < 0):
+			nullchar_offset = self.data.find(b"\x00", fld_start)
+			if (nullchar_offset < 0):
 				raise MessageDecodeError("Could not locate name terminator for field #%d" % fld_id)
-			# we check if there is enough data in the message to unpack this field's attributes. It's 18 bytes
-			# Note that self.lenght is not counting the type qualifer, so we're off by 1
-			if ((self.length - name_terminator) < 18):
-				raise MessageDecodeError("Not enough numeric attribute bytes after the name at field #%d" % fld_id)
+
+			fld_end = nullchar_offset + 1 + FieldDefinition.packer.size
+			
+			if (fld_end > total_length):
+				raise MessageDecodeError("Not enough numeric attribute bytes after the field name at field #%d" % fld_id)
 
 			# we also test encoding compliance explicitly
 			try:
-				name_decoded = self.data[next_start:name_terminator].decode()
+				self.data_fields.append(FieldDefinition.from_buffer(self.data[fld_start:fld_end]))
 			except Exception as e_decode:
 				raise MessageDecodeError("Unable to decode name string at field #%d - %s(%s)" % (fld_id, e_decode.__class__.__name__, e_decode))
 
-			# time to pick up the pieces
-			#print(self.data[name_terminator + 1:name_terminator + 19])
-			num_f = struct.unpack("!ihihih", self.data[name_terminator + 1:name_terminator + 19])
-			self.append(pg_data.FieldDefinition(name = name_decoded,
-				rel_oid = num_f[0], att_num = num_f[1],	type_oid = num_f[2],
-				type_len = num_f[3], type_mod = num_f[4], format_code = num_f[5]
-			))
+			if (fld_end == total_length):
+				# done
+				break
 
-			next_start = name_terminator + 19
-
-		if (next_start < (self.length + 1)): # remember we're off by one
-			raise MessageDecodeError("Trailing garbage bytes in row description message")
-
+			# me move onto the next one
+			fld_start = fld_end
+		
 		return True
 
 	def info_str(self):
 		# We let the data class do the heavy lifting here
-		return str(self.fields)
+		return "%d fields: " % len(self.data_fields) + str(self.data_fields)
 
 	def create_row(self, values = ()):
 		"""
@@ -974,6 +1077,64 @@ class RowDescription(QualifiedMessage):
 
 
 
+# class DataRow(QualifiedMessage):
+# 	"""
+# 		One of these is sent off to the frontend for each data row in a set.
+# 		It's not possible to use this class on its own to decode a record as
+# 		from a buffer as a DataRow definition is necessary for that.
+# 		
+# 		The factory for these objects is RowDescription.decode_row()
+
+# 		Rows are immutale
+# 	"""
+# 	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+# 	TYPE_QUALIFIER = b"D"
+# 	# the "fields" is just an instance of the row description, empty by default
+# 	PAYLOAD_MEMBERS = {
+# 		"row_fields": []
+# 	}
+# 	AUTO_DECODE = False
+
+# 	_FIELD_COUNT_PACKER = struct.Struct("!h")
+# 	_FIELD_SIZE_PACKER = struct.Struct("!i")
+
+# 	def __init__(self, fields):
+# 		"""
+# 			Accepts any iterable of PGTypes
+# 		"""
+# 		super().__init__()
+# 		for fld in fields:
+# 			if (not isinstance(fld, pg_data.PGType)):
+# 				raise TypeError("All members of fields must be instances of PGType")
+# 		self.fields = tuple(fields)
+
+# 	def encode_hook(self):
+# 		"""
+# 			The type's __bytes___ do all the heavy lifting here
+# 		"""
+# 		out_cells = tuple(map(bytes, self.fields))
+
+# 		return (
+# 			self._FIELD_COUNT_PACKER.pack(len(out_cells))
+# 		+
+# 			b"".join(self._FIELD_SIZE_PACKER.pack(len(cell)) + cell for cell in out_cells)
+# 		)
+
+
+# 	def decode(self):
+# 		"""
+# 			Unlike most message types, it is impossible to decode 
+# 		"""
+# 		if (len(self.data) < self.SIGNATURE_SIZE + self._FIELD_COUNT_PACKER.size):
+# 			raise MessageDecodeError("Insufficient bytes for a meaningful DataRow message")
+# 		fld_num = self._FIELD_COUNT_PACKER.unpack(self.data[self.SIGNATURE_SIZE:self.SIGNATURE_SIZE + self._FIELD_COUNT_PACKER.size])[0]
+# 		
+# 		flds = []
+# 		fld_size_pos = self.SIGNATURE_SIZE + self._FIELD_COUNT_PACKER.size
+# 		for fld_id in range(0, fld_num):
+# 			fld_width = 
+
+# 		return True
 
 
 
@@ -1017,3 +1178,6 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 
 
 
+x = RowDescription((FieldDefinition("frank", pg_data.PGBoolean),))
+x.encode()
+print(x)

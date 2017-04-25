@@ -24,6 +24,23 @@ SQL interface.
 
 """
 
+# generated from `grep define src/include/catalog/pg_type.h | grep OID ....`
+BUILTIN_OIDS = {
+	"BOOLOID": 16, "BYTEAOID": 17, "CHAROID": 18, "NAMEOID": 19, "INT8OID": 20, "INT2OID": 21, "INT2VECTOROID": 22, "INT4OID": 23, "REGPROCOID": 24, "TEXTOID": 25, "OIDOID": 26,"TIDOID": 27,
+	"XIDOID": 28, "CIDOID": 29, "OIDVECTOROID": 30, "JSONOID": 114, "XMLOID": 142, "PGNODETREEOID": 194, "PGNDISTINCTOID": 3361, "PGDEPENDENCIESOID": 3402, "PGDDLCOMMANDOID": 32, "POINTOID": 600,
+	"LSEGOID": 601, "PATHOID": 602, "BOXOID": 603, "POLYGONOID": 604, "LINEOID": 628, "FLOAT4OID": 700, "FLOAT8OID": 701, "ABSTIMEOID": 702, "RELTIMEOID": 703, "TINTERVALOID": 704, "UNKNOWNOID": 705,
+	"CIRCLEOID": 718, "CASHOID": 790, "MACADDROID": 829, "INETOID": 869, "CIDROID": 650, "MACADDR8OID": 774, "INT2ARRAYOID": 1005, "INT4ARRAYOID": 1007, "TEXTARRAYOID": 1009, "OIDARRAYOID": 1028,
+	"FLOAT4ARRAYOID": 1021, "ACLITEMOID": 1033, "CSTRINGARRAYOID": 1263, "BPCHAROID": 1042, "VARCHAROID": 1043, "DATEOID": 1082, "TIMEOID": 1083, "TIMESTAMPOID": 1114, "TIMESTAMPTZOID": 1184,
+	"INTERVALOID": 1186, "TIMETZOID": 1266, "BITOID": 1560, "VARBITOID": 1562, "NUMERICOID": 1700, "REFCURSOROID": 1790, "REGPROCEDUREOID": 2202, "REGOPEROID": 2203, "REGOPERATOROID": 2204,
+	"REGCLASSOID": 2205, "REGTYPEOID": 2206, "REGROLEOID": 4096, "REGNAMESPACEOID": 4089, "REGTYPEARRAYOID": 2211, "UUIDOID": 2950, "LSNOID": 3220, "TSVECTOROID": 3614, "GTSVECTOROID": 3642,
+	"TSQUERYOID": 3615, "REGCONFIGOID": 3734, "REGDICTIONARYOID": 3769, "JSONBOID": 3802, "INT4RANGEOID": 3904, "RECORDOID": 2249, "RECORDARRAYOID": 2287, "CSTRINGOID": 2275, "ANYOID": 2276,
+	"ANYARRAYOID": 2277, "VOIDOID": 2278, "TRIGGEROID": 2279, "EVTTRIGGEROID": 3838, "LANGUAGE_HANDLEROID": 2280, "INTERNALOID": 2281, "OPAQUEOID": 2282, "ANYELEMENTOID": 2283,"ANYNONARRAYOID": 2776,
+	"ANYENUMOID": 3500, "FDW_HANDLEROID": 3115, "INDEX_AM_HANDLEROID": 325, "TSM_HANDLEROID": 3310, "ANYRANGEOID": 3831
+}
+# This is a dictionary we resolve OIDs into the relevant classes from (will be monkey-patched later)
+OID_CLASSES = {}
+
+
 class TypeEncodeError(Exception):
 	pass
 	
@@ -31,31 +48,39 @@ class TypeDecodeError(Exception):
 	pass
 
 
-class PGScalar():
+class PGType():
 	"""
-		Generic base class to implement protocol representation of various SQL scalar primitives.
-		
+		Generic base class to implement protocol representation of various SQL
+		data type primitives.
+
 		The PACK_STRING is actually used by other classes to monkey-patch several
 		types into a combined record processor with a pre-compiled pack string when possible
 
 		The byte-order is always bigendian.
-		
+
+		All types are immutable
+
 		Multiple inheritance comes handy here
 
 	"""
+	OID_SYMBOL = None
 	PACK_STRING = None
+
+	oid = None
 	packer = None
 	pack = None
 	unpack = None
-	
+	length = None
+
 
 	# For some reason, the following composition breaks Decimal handling for PGNumeric
 	#def __new__(cls, *args, **kwargs):
 
-		#if ((cls.PACK_STRING is PGScalar.PACK_STRING) and (cls.pack is PGScalar.pack)):
+		#if ((cls.PACK_STRING is PGType.PACK_STRING) and (cls.pack is PGType.pack)):
 			#raise AttributeError("Cannot instantiate %d directly as it does not override either PACK_STRING or pack()/unpack()")
 
 		#return super().__new__(cls)
+
 
 	@classmethod
 	def from_buffer(cls, buffer_data):
@@ -72,6 +97,7 @@ class PGScalar():
 			raise TypeDecodeError("Unable to decode %s from buffer: %s(%s)" % (cls.__name__, e_decode.__class__.__name__, e_decode))
 
 
+
 	def pack(self):
 		"""
 			the default pack function tries to use the prepared packer and is left
@@ -83,20 +109,21 @@ class PGScalar():
 	__bytes__ = pack
 	
 
-class PGBool(PGScalar, int):
+class PGBoolean(PGType, int):
 
 	"""
 		Bool cannot be subclassed, so we need to fake it in a very crude way.
 		Better ideas are welcome
 	"""
+	OID_SYMBOL = "BOOLOID"
 	PACK_STRING = "b"
 	
-	def __new__(cls, *argc, **argv):
+	def __new__(cls, *args, **kwargs):
 		"""
 			This ensure that they can pass in whatever they want for boolean evaluation,
 			much like whith bool
 		"""
-		return int.__new__(cls, 1 if argc[0] else 0)
+		return int.__new__(cls, 1 if (len(args) and args[0]) else 0)
 	
 	# define some base methods for the next steps to work
 	def __bool__(self):	return (self is not None) and self != 0
@@ -114,24 +141,33 @@ class PGBool(PGScalar, int):
 
 
 
-class PGSmallInt(PGScalar, int):
+class PGSmallInt(PGType, int):
+	OID_SYMBOL = "INT2OID"
 	PACK_STRING = "h"
 
-class PGInt(PGScalar, int):
+class PGInt(PGType, int):
+	OID_SYMBOL = "INT4OID"
 	PACK_STRING = "i"
 
-class PGBigInt(PGScalar, int):
+class PGBigInt(PGType, int):
+	OID_SYMBOL = "INT8OID"
 	PACK_STRING = "q"
 
-class PGReal(PGScalar, float):
+class PGReal(PGType, float):
+	OID_SYMBOL = "FLOAT4OID"
 	PACK_STRING = "f"
 
-class PGDouble(PGScalar, float):
+class PGDouble(PGType, float):
+	OID_SYMBOL = "FLOAT8OID"
 	PACK_STRING = "d"
+	
+class PGFloat(PGDouble):
+	pass
 
 
 # Variable-length types below.
-class PGNumeric(PGScalar, decimal.Decimal):
+class PGNumeric(PGType, decimal.Decimal):
+	OID_SYMBOL = "NUMERICOID"
 
 	# the following are copied as-is from https://doxygen.postgresql.org/pgtypes__numeric_8h_source.html
 	# and will have to be updated manually if need be
@@ -256,8 +292,6 @@ class PGNumeric(PGScalar, decimal.Decimal):
 
 
 		return pck.pack(len(quartets), weight, sign, scale, *quartets)
-			
-		
 
 
 	# This is weird: it looks like Decimal resolves to None when its __bytes__is accessed,
@@ -265,109 +299,87 @@ class PGNumeric(PGScalar, decimal.Decimal):
 	__bytes__ = pack
 
 
-#class PGText(PGScalar, str):
-	#def pack(self):	return str.encode()
+# Text types
+class PGText(PGType, str):
+	OID_SYMBOL = "TEXTOID"
+	"""
+		TEXT. All other multibyte string types are just the same thing
+	"""
+	@classmethod
+	def unpack(cls, buffer_data): return buffer_data.encode()
+	def pack(self):	return str.encode()
 
 
-# Non packable strings follow
-#class PGC(PGScalar, str):
-	#def pack(self):	return str.encode()
+class PGChar(PGText):
+	OID_SYMBOL = "CHAROID"
+
+class PGVarChar(PGText):
+	OID_SYMBOL = "VARCHAROID"
+
+
+
+# Binary types
+class PGBytea(PGType, bytes):
+	OID_SYMBOL = "BYTEAOID"
+	"""
+		This is already packed by definition
+	"""
+	def unpack(cls, buffer_data): return buffer_data
+	def pack(self):	return self
 
 
 
 class FieldDefinition():
 	"""
-		Helper class to properly describe the attribute of a data field, as
+		Helper class to properly describe the attributes of a data field, as
 		understood by the protocol (see the RowDescription message type at
 		https://www.postgresql.org/docs/current/static/protocol-message-formats.html )
+
+		Differences from the format described in the document are that the type is
+		a reference to a subclass of PGType and that the type length is not specified as
+		it is dictated by the referenced class (it's -1 if the class does not have a packer
+		structure)
 	"""
+
 
 	def __init__(self,
 		name,
+		data_type,
 		rel_oid = 0,
 		att_num = 0,
-		type_oid = 0,
-		type_len = -1,
 		type_mod = 0,
-		format_code = 0
+		binary = False
 	):
 		"""
 			A very simple constructor that hydrates the members. See the document
 			referenced in the class docstring for their definitions.
-			
+
 			All arguments straight-out turn into members.
-			
+
 			Note that the defaults pretty much specify what you'd get with "unknown"
 		"""
 
 		# any defined argument here becomes a member
 		sl = locals().copy()
+		if (not issubclass(data_type, PGType)):
+			raise TypeError("%s is not a subclass of PGType" % pg_type.__name__)
+
 		[setattr(self, arg_in, sl[arg_in]) for arg_in in sl.keys()]
 
 	def __str__(self):
-		return "name = `%s`, rel_oid = %d, att_num = %d, type_oid = %d, type_len = %d, type_mod = %d, format_code = %d" % (
-			self.name, self.rel_oid, self.att_num, self.type_oid, self.type_len,
-			self.type_mod, self.format_code
+		return "name = `%s`, type = %s(OID: %d, %s), rel_oid = %d, att_num = %d, type_mod = %d, encoded as %s" % (
+			self.name,
+			self.data_type.__name__,
+			self.data_type.oid,
+			("%d bytes" % self.data_type.length) if (self.data_type.length is not None) else "variable size",
+			self.rel_oid,
+			self.att_num,
+			self.type_mod,
+			"binary" if self.binary else "text"
 		)
 
 	def __repr__(self):
-		return "< %s >" % self.__str__()
-
-
-	
-class RowDefinition(list):
-	"""
-		Phython lists come in handy here, as a row definition is just that:
-		a list of FieldDefinitions.
-
-		The overrides are there to stop wrong types
-		
-		Ideal instantiation example:
-
-		x = RowDescription(RowDefinition([
-			FieldDefinition(name = "foo"),
-			FieldDefinition(name = "bar", type_len = 1234),
-		]))
-
-	"""
-	ACCEPTED_CLASS = FieldDefinition
-
-	def validate_member(self, value):
-		"""
-			Simply throw an exception if they try to add an member of an unsupported
-			type
-			
-			Args:
-				value:	what needs to be validated
-				
-			Return:
-				always true, as it throws an exception when validation fails
-		"""
-		if (not isinstance(value, self.ACCEPTED_CLASS)):
-			raise TypeError("%ss only accepts `%s` instances as their members. `%s` was supplied" % (self.__class__.__name__, self.ACCEPTED_CLASS.__name__, value.__class__.__name__))
-			return True
-
-	def append(self, value):
-		self.validate_member(value)
-		return super().append(value)
-
-	def insert(self, index, value):
-		self.validate_member(value)
-		return super().insert(index, value)
-
-	def extend(self, value):
-		[self.validate_member(member) for member in value]
-		return super().extend(value)
-	
-	def __iadd__(self, value):
-		[self.validate_member(member) for member in value]
-		return super().__iadd__(value)
-
-	def __str__(self):
-		return "%d columns(%s)" % (len(self), "), (".join(map(str, self)))
-
-	def __repr__(self):
-		return "< %s >" % self.__str__()
+		return "< %s(%s) >" % (self.__class__.__name__, self.__str__())
 
 
 
@@ -383,16 +395,25 @@ class RowDefinition(list):
 for (name, pg_type) in dict(sys.modules[__name__].__dict__.items()).items():
 	# if the message has a non-empty type qualifier, we ensure that it is valid
 	if (isinstance(pg_type, type)):
-		if (issubclass(pg_type, PGScalar) and (pg_type is not PGScalar)):
+		if (issubclass(pg_type, PGType) and (pg_type is not PGType)):
+			
+			# populate the oid->class resolver and the oid
+			if (pg_type.OID_SYMBOL is None):
+				raise AttributeError("%s does not define an OID_SYMBOL")
+			
+			pg_type.oid = BUILTIN_OIDS[pg_type.OID_SYMBOL]
+			OID_CLASSES[BUILTIN_OIDS[pg_type.OID_SYMBOL]] = pg_type
+			
 			# if the class has a custom pack() we don't touch it
-			if (pg_type.pack is PGScalar.pack):
-				if (pg_type.unpack is not PGScalar.unpack):
+			if (pg_type.pack is PGType.pack):
+				if (pg_type.unpack is not PGType.unpack):
 					raise AttributeError("%s overrides pack() but not unpack(). Cannot continue" % pg_type.__name__)
-				if ((pg_type.PACK_STRING is PGScalar.PACK_STRING) or (len(pg_type.PACK_STRING) == 0)):
+				if ((pg_type.PACK_STRING is PGType.PACK_STRING) or (len(pg_type.PACK_STRING) == 0)):
 					raise AttributeError("%s neither overrides pack() nor PACK_STRING. Cannot continue" % pg_type.__name__)
 				# There's a string to pack. We create the persistent packing object
 				# and wrap the packing function around it
 				pg_type.packer = struct.Struct("!" + pg_type.PACK_STRING)
+				pg_type.length = pg_type.packer.size
 			if (not callable(pg_type.pack)):
 				raise AttributeError("%s overrides pack() into a non-callable" % pg_type.__name__)
 
