@@ -98,11 +98,15 @@ class Listener(object):
 		# each member is a 2 tuple containing the remote peer and the origiating listener socket
 		self.children = {}
 
+		for new_address in addresses:
+			try:
+				self.add_bind_targets(new_address)
+			except DNSException as e_abt:
+				LOGGER.warning("Could not resolve `%s`: %s(%s). Will proceed without binding it", new_address, e_abt.__class__.__name__, e_abt)
 
 		if (start_on_init):
-			self.start(addresses)
-		else:
-			self.add_bind_targets(addresses)
+			self.start()
+
 
 
 	def add_bind_targets(self, addresses):
@@ -139,8 +143,8 @@ class Listener(object):
 						type = socket.SOCK_STREAM,
 						proto = socket.IPPROTO_TCP
 					)
-				except Exception as e_ns:
-					raise DNSException("Unable to resolve `%s`" % (new_address)) from e_ns
+				except socket.gaierror as e_ns:
+					raise DNSException("Unable to resolve `%s`: %s(%s)" % (new_address, e_ns.__class__.__name__, e_ns)) from e_ns
 
 				# we filter the results and add to the list of "usable addresses"
 				for usable_address in filter(
@@ -224,20 +228,16 @@ class Listener(object):
 		self._listener_pid = None
 
 
-	def start(self, addresses = ()):
+	def start(self):
 		"""
 			Initializes al necessary sockets and essentially prepares the listener
 			for accept()s.
 			
 			Returns None or fails fatally if one any of the bind() or listen() calls fails.
 			Tries to clean up after it self on failure
-
-			Args:
-				addresses:		(iterable)Passed as-is to add_bind_targets()
 		"""
 		
 		self._listener_pid = os.getpid()
-		self.add_bind_targets(addresses)
 
 		for (af, addresses) in self.bind_addresses.items():
 			for (raw_addr, aliases) in addresses.items():
@@ -283,27 +283,31 @@ class Listener(object):
 							ts.close()
 							del(ts)
 						except ConnectionRefusedError as e_cnn:
-							LOGGER.info("Stale, unconnectible socket `%s` detected. Removing", bind_addr_str)
+							LOGGER.info("Socket `%s` was found and it is not listening. This is probably stale. Removing", bind_addr_str)
 							os.unlink(bind_addr)
 
 				try:
-					
-
 					self.socket_objects[af][raw_addr].bind(bind_addr)
+					bind_ok = True
 					# add socket to dictionary
-
 					LOGGER.debug("Bound new socket to `%s`" % (bind_addr_str,))
-				except Exception as e_bind:
-					self.stop()
-					raise SocketException("Could not bind socket to address `%s`" % (bind_addr_str,)) from e_bind
+				except (OSError, FileNotFoundError) as e_bind:
+					bind_ok = False
+					LOGGER.warning("Could not bind socket to `%s`: %s(%s). The listener will not be available on this address", bind_addr_str, e_bind.__class__.__name__, e_bind)
 
-				try:
-					self.socket_objects[af][raw_addr].listen()
-					LOGGER.debug("Socket bound to `%s` is now listening" % (bind_addr_str,))
-				except Exception as e_listen:
-					self.stop()
-					raise SocketException("Could listen on socket bound to `%s`" % (bind_addr_str,)) from e_listen
+				if (bind_ok):
+					try:
+						self.socket_objects[af][raw_addr].listen()
+						listen_ok = True
+						LOGGER.debug("Socket bound to `%s` is now listening" % (bind_addr_str,))
+					except Exception as e_listen:
+						listen_ok = False
+						raise SocketException("Could listen on socket bound to `%s`" % (bind_addr_str,)) from e_listen
 
+				# these addresses have failed. We wipe their sockets
+				if (not (bind_ok and listen_ok)):
+					self.socket_objects[af][raw_addr].close()
+					self.socket_objects[af][raw_addr] = None
 
 
 		# TIS vital!!!
