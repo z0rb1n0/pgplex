@@ -10,7 +10,9 @@ import ssl
 
 
 import guc
+import pg_data
 import pg_messages
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -378,15 +380,36 @@ class DownStreamSession(ipc_streams.Stream):
 
 					msg.decode()
 					self.state = pg_messages.SessionState.Active
-					bartek = pg_messages.ErrorResponse()
-					bartek.messages.append(("C", "XX000"))
-					bartek.messages.append(("M", "Nothing is implemented yet"))
-					bartek.messages.append(("H", "Time to get off your ass and help Fabio with commits. Glory awaits :-)"))
-					bartek.encode()
-					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = bartek)
+					
+					
+					
+					rd = pg_messages.RowDescription([
+						pg_messages.FieldDefinition("this_pid", pg_data.PGInt),
+						pg_messages.FieldDefinition("your_query", pg_data.PGVarChar)
+					])
+					rd.encode()
+					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = rd)
+					for n in range(1995, 2017, 1):
+						row = rd.create_row([os.getpid(), "We're making it!!! Here's your query: `%s`" % msg.query])
+						row.encode()
+						self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = row)
 
 
+					
+# 					bartek = pg_messages.ErrorResponse()
+# 					bartek.messages.append(("C", "XX000"))
+# 					bartek.messages.append(("M", "Nothing is implemented yet"))
+# 					bartek.messages.append(("H", "Time to get off your ass and help Fabio with commits. Glory awaits :-)"))
+# 					bartek.encode()
+# 					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = bartek)
+
+					cc = pg_messages.CommandComplete()
+					cc.command = "SELECT"
+					cc.encode()
+					self.send_message(peer_type = pg_messages.PeerType.FrontEnd, message = cc)
 					self.state = pg_messages.SessionState.WaitingForQuery
+					
+					
 			
 			
 				if (self.state == pg_messages.SessionState.WaitingForQuery):

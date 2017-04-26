@@ -312,6 +312,7 @@ class Message(object):
 
 		return out_obj
 
+	# common method alias
 	from_bytes = from_buffer
 
 
@@ -635,6 +636,8 @@ class ErrorResponse(ResponseToUser):
 
 
 
+
+
 class Authentication(QualifiedMessage):
 	"""
 		Any of AuthenticationKerberosV5, AuthenticationCleartextPassword and so on
@@ -847,7 +850,7 @@ class Query(QualifiedMessage):
 		PeerType.BackEnd: (SessionState.WaitingForQuery,)
 	}
 
-	AUTO_DECODE = False
+	AUTO_DECODE = True
 	def decode_hook(self):
 		self.query = self.data[self.SIGNATURE_SIZE:-1].decode()
 		return True
@@ -858,7 +861,79 @@ class Query(QualifiedMessage):
 		return self.query.encode()
 
 	def info_str(self):
-		return self.query.replace("\\n", "\\\\n")[0:32] if (self.query is not None) else "/* no query */"
+		if (self.query is None):
+			return "/* no query */"
+
+		return self.query.replace("\n", "\\n")[0:32] + (("... (%d chars total)" % len(self.query)) if len(self.query) > 32 else "")
+
+
+class CommandComplete(QualifiedMessage):
+	"""
+		Tags to send out after command completion.
+		
+		They come in a few simple templates.
+		
+		Output OID is not supported
+
+	"""
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"C"
+	PAYLOAD_MEMBERS = {
+		"command": None,
+		"table_oid": None,
+		"affected_rows": None
+	}
+	VALID_START_STATES = {
+		PeerType.FrontEnd: (SessionState.WaitingForResultState,)
+	}
+	AUTO_DECODE = True
+
+
+	def decode_hook(self):
+		# same as query...
+		tokens = tuple(t.strip().upper() for t in self.data[self.SIGNATURE_SIZE:-1].decode().split(" "))
+		
+		self.command = tokens[0] if len(tokens[0]) else "UNKNOWN"
+
+		self.table_oid = None
+		self.affected_rows = None
+		# we prepare index -> attribute name maps
+		if (len(tokens) == 1):
+			pairs = ()
+		if (len(tokens) == 2):
+			pairs = ((1, "affected_rows"),)
+		if (len(tokens) == 3):
+			pairs = ((1, "table_oid"), (2, "affected_rows"))
+
+		for pair in pairs:
+			try:
+				t_val = int(tokens[pair[0]])
+			except Exception:
+				t_val = -1
+			setattr(self, pair[1], t_val)
+
+
+		return True
+
+
+	def get_cmd_text(self):
+		""" Utility function to put the message together """
+		msg = self.command
+		for n in (self.table_oid, self.affected_rows):
+			if (n is not None):
+				msg += (" %d" % n)
+
+		return msg
+
+	def encode_hook(self):
+		if (self.command is None):
+			raise MessageEncodeError("Command is not set")
+		return self.get_cmd_text().encode() + b"\00"
+
+	def info_str(self):
+		if (self.command is None):
+			return "/* no command */"
+		return self.get_cmd_text()
 
 
 
@@ -922,7 +997,7 @@ class FieldDefinition():
 
 		try:
 			f_name = buffer[0:nullchar_offset].decode()
-		except Exception as e_decode:
+		except UnicodeDecodeError as e_decode:
 			raise ValueError("Error while decoding field name: %s(%s)" % (e_decode.__class__.__name__, e_decode))
 
 		(reloid, attnum, typoid, typsize, typmod, isbinary) = cls.packer.unpack(buffer[nullchar_offset + 1:])
@@ -940,11 +1015,31 @@ class FieldDefinition():
 		)
 
 
+	def create_value(self, input):
+		"""
+			Takes the external representation of a type, or anything
+			castable to it, after performing additional validation based on
+			additional information such as the length modifier returns an instance
+			of the relevant subclass of PGType
+
+			Think of it as a combination of the effects of INPUT and RECEIVE on CREATE TYPE
+
+			TODO:	perform actual validation based against the additional attributes :-)
+					Still working out the effects of typlen and such on layer7
+
+			Args:
+				the value to be "cast"
+			Return:
+				An instance of a PGType subclass
+		"""
+		return self.data_type(input) if (input is not None) else None
+
+
 	def __bytes__(self):
-		""" Converts to the network representation """
+		""" Converts to the network representation, fragment of RowDescription """
 		return self.name.encode() + b"\00" + self.packer.pack(
 			self.rel_oid, self.att_num, self.data_type.oid,
-			self.data_type.length, self.type_mod, int(self.is_binary)
+			self.data_type.length if (self.data_type.length is not None) else -1, self.type_mod, int(self.is_binary)
 		)
 
 	def __str__(self):
@@ -994,7 +1089,7 @@ class RowDescription(QualifiedMessage):
 
 	def __init__(self, field_definitions):
 		"""
-			The constructor accepts a RowDefinition type, which is immutable
+			The constructor accepts an iterable of FieldDefinition instances
 			We pre-hydrate the "fields" member with that list of FieldDefinitions
 		"""
 		super().__init__()
@@ -1041,7 +1136,7 @@ class RowDescription(QualifiedMessage):
 			# we also test encoding compliance explicitly
 			try:
 				self.data_fields.append(FieldDefinition.from_buffer(self.data[fld_start:fld_end]))
-			except Exception as e_decode:
+			except MessageDecodeError as e_decode:
 				raise MessageDecodeError("Unable to decode name string at field #%d - %s(%s)" % (fld_id, e_decode.__class__.__name__, e_decode))
 
 			if (fld_end == total_length):
@@ -1057,84 +1152,118 @@ class RowDescription(QualifiedMessage):
 		# We let the data class do the heavy lifting here
 		return "%d fields: " % len(self.data_fields) + str(self.data_fields)
 
+
 	def create_row(self, values = ()):
 		"""
-			Row formatting function. Simply expects an iterable of values.
-			The supported input types for each member are None, bool, int, float, str, byte[array].
-			They're translated into the closest approximation of an on-the-wire type representation
-			that is defined in the row definition.
+			Row generation function. Simply a shorthand
 
 			Args:
-				values:			an iterable of the values.
-								The wrong number of members for this RowDefinition or any member that
-								cannot be cast to the matching FieldDefinition cause an exception
-			
+				values:			an iterable with the values.
 			Return:
 				a DataRow instance
-
 		"""
-		pass
+		return DataRow(self, values)
 
 
 
-# class DataRow(QualifiedMessage):
-# 	"""
-# 		One of these is sent off to the frontend for each data row in a set.
-# 		It's not possible to use this class on its own to decode a record as
-# 		from a buffer as a DataRow definition is necessary for that.
-# 		
-# 		The factory for these objects is RowDescription.decode_row()
 
-# 		Rows are immutale
-# 	"""
-# 	ALLOWED_RECIPIENTS = PeerType.FrontEnd
-# 	TYPE_QUALIFIER = b"D"
-# 	# the "fields" is just an instance of the row description, empty by default
-# 	PAYLOAD_MEMBERS = {
-# 		"row_fields": []
-# 	}
-# 	AUTO_DECODE = False
-
-# 	_FIELD_COUNT_PACKER = struct.Struct("!h")
-# 	_FIELD_SIZE_PACKER = struct.Struct("!i")
-
-# 	def __init__(self, fields):
-# 		"""
-# 			Accepts any iterable of PGTypes
-# 		"""
-# 		super().__init__()
-# 		for fld in fields:
-# 			if (not isinstance(fld, pg_data.PGType)):
-# 				raise TypeError("All members of fields must be instances of PGType")
-# 		self.fields = tuple(fields)
-
-# 	def encode_hook(self):
-# 		"""
-# 			The type's __bytes___ do all the heavy lifting here
-# 		"""
-# 		out_cells = tuple(map(bytes, self.fields))
-
-# 		return (
-# 			self._FIELD_COUNT_PACKER.pack(len(out_cells))
-# 		+
-# 			b"".join(self._FIELD_SIZE_PACKER.pack(len(cell)) + cell for cell in out_cells)
-# 		)
+class DataRow(QualifiedMessage):
+	"""
+		One of these is sent off to the frontend for each data row in a set.
+		It's not possible to use this class on its own to decode a record
+		from a buffer as a DataRow definition is necessary for that.
+		RowDescription.decode_row() does exactly that
 
 
-# 	def decode(self):
-# 		"""
-# 			Unlike most message types, it is impossible to decode 
-# 		"""
-# 		if (len(self.data) < self.SIGNATURE_SIZE + self._FIELD_COUNT_PACKER.size):
-# 			raise MessageDecodeError("Insufficient bytes for a meaningful DataRow message")
-# 		fld_num = self._FIELD_COUNT_PACKER.unpack(self.data[self.SIGNATURE_SIZE:self.SIGNATURE_SIZE + self._FIELD_COUNT_PACKER.size])[0]
-# 		
-# 		flds = []
-# 		fld_size_pos = self.SIGNATURE_SIZE + self._FIELD_COUNT_PACKER.size
-# 		for fld_id in range(0, fld_num):
-# 			fld_width = 
+		Rows are immutale
 
-# 		return True
+		Example of usage
+			rd = RowDescription([
+				FieldDefinition("id", pg_data.PGBigInt),
+				FieldDefinition("name", pg_data.PGVarchar)
+			])
+			row = rd.create_row([1234, "Frank"])
+			row2 = DataRow(rd, [1234, "Frank"])
+
+			buffer = from_network()
+			row3 = rd.decode_row(buffer)
+
+	"""
+	ALLOWED_RECIPIENTS = PeerType.FrontEnd
+	TYPE_QUALIFIER = b"D"
+	# the "fields" is just an instance of the row description, empty by default
+	PAYLOAD_MEMBERS = {
+		"description": None,
+		"data_fields": []
+	}
+	AUTO_DECODE = False
+
+	_FIELD_COUNT_PACKER = struct.Struct("!h")
+	_FIELD_SIZE_PACKER = struct.Struct("!i")
+
+	def __init__(self, description, values):
+		"""
+			Constructs a DataRow object based on a RowDescription
+			and a list of values that need to match them in number and cast-ability
+			The wrong number of members for this RowDefinition or any member that
+			cannot be cast to the matching FieldDefinition cause an exception
+			
+			Args:
+				description:	an instance of RowDescription to validate/encode the row againts/from
+				fields:			the fields data. Each member needs to be cast-able to the relevant type
+			
+		"""
+		super().__init__()
+		if (len(values) != len(description.data_fields)):
+			raise ValueError("Incorrect number of values (%d) for this record definition (%s)" % (len(values), description))
+
+		self.description = copy.deepcopy(description)
+		self.data_fields.extend([ description.data_fields[fld_id].data_type(values[fld_id]) for fld_id in range(0, len(values), 1) ])
+
+
+	def encode_hook(self):
+		"""
+			The type's __bytes___ do all the heavy lifting here.
+			
+			One exception is when the FieldDefinition sets is_binary
+		"""
+		out_cells = []
+		for fld_id in range(0, len(self.data_fields), 1):
+			if self.description.data_fields[fld_id].is_binary:
+				out_cells.append(bytes(self.data_fields[fld_id]))
+			else:
+				# note that we still need to encode our text representations
+				out_cells.append(str(self.data_fields[fld_id]).encode())
+		return (
+			self._FIELD_COUNT_PACKER.pack(len(out_cells))
+		+
+			b"".join(self._FIELD_SIZE_PACKER.pack(len(cell)) + cell for cell in out_cells)
+		)
+
+
+	def info_str(self):
+		
+		# this was initially implemented as an one liner...
+		str_descs = []
+		for f in self.data_fields:
+			if (f is None):
+				out_str = "None"
+			else:
+				q = ""
+				out_str = f.__class__.__name__
+				# variable length values have a length qualifier.
+				# Numeric is an exception tho
+				if ((f.packer is None) and (not isinstance(f, pg_data.PGNumeric))):
+					out_str += "(%d)" % len(str(f))
+					q = "'"
+
+				# the string is truncated not to flood logs/terminals
+				out_str += ":" + q + str(f)[0:32] + q + ")"
+			str_descs.append(out_str)
+
+		return "%d fields:(%s)" % (len(self.data_fields), ", ".join(str_descs))
+
+
 
 
 
@@ -1175,9 +1304,3 @@ for (name, msg_class) in dict(sys.modules[__name__].__dict__.items()).items():
 			msg_class.RESERVED_PROTOCOL_VERSION_PACKED = b"".join(
 				map(lambda v : v.to_bytes(length = 2, byteorder = "big"), msg_class.RESERVED_PROTOCOL_VERSION)
 			)
-
-
-
-x = RowDescription((FieldDefinition("frank", pg_data.PGBoolean),))
-x.encode()
-print(x)

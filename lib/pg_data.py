@@ -97,15 +97,14 @@ class PGType():
 			raise TypeDecodeError("Unable to decode %s from buffer: %s(%s)" % (cls.__name__, e_decode.__class__.__name__, e_decode))
 
 
-
 	def pack(self):
 		"""
 			the default pack function tries to use the prepared packer and is left
-			as-is for simple types
+			as-is for simple types. Types with special needs override it into
+			something more peculiar
 		"""
 		return self.packer.pack(self)
 
-	# this is just an alias now
 	__bytes__ = pack
 	
 
@@ -307,7 +306,8 @@ class PGText(PGType, str):
 	"""
 	@classmethod
 	def unpack(cls, buffer_data): return buffer_data.encode()
-	def pack(self):	return str.encode()
+	def pack(self):	return self.encode()
+
 
 
 class PGChar(PGText):
@@ -315,7 +315,6 @@ class PGChar(PGText):
 
 class PGVarChar(PGText):
 	OID_SYMBOL = "VARCHAROID"
-
 
 
 # Binary types
@@ -326,7 +325,7 @@ class PGBytea(PGType, bytes):
 	"""
 	def unpack(cls, buffer_data): return buffer_data
 	def pack(self):	return self
-
+	
 
 
 
@@ -351,7 +350,12 @@ for (name, pg_type) in dict(sys.modules[__name__].__dict__.items()).items():
 			
 			pg_type.oid = BUILTIN_OIDS[pg_type.OID_SYMBOL]
 			OID_CLASSES[BUILTIN_OIDS[pg_type.OID_SYMBOL]] = pg_type
-			
+
+
+			# pack() might have been overridden, so we
+			# always need to target __bytes__() at its current value
+			setattr(pg_type, "__bytes__", pg_type.pack)
+
 			# if the class has a custom pack() we don't touch it
 			if (pg_type.pack is PGType.pack):
 				if (pg_type.unpack is not PGType.unpack):
@@ -362,6 +366,11 @@ for (name, pg_type) in dict(sys.modules[__name__].__dict__.items()).items():
 				# and wrap the packing function around it
 				pg_type.packer = struct.Struct("!" + pg_type.PACK_STRING)
 				pg_type.length = pg_type.packer.size
-			if (not callable(pg_type.pack)):
-				raise AttributeError("%s overrides pack() into a non-callable" % pg_type.__name__)
+
+			else:
+				# this class overrode pack()
+				if (not callable(pg_type.pack)):
+					raise AttributeError("%s overrides pack() into a non-callable" % pg_type.__name__)
+
+
 

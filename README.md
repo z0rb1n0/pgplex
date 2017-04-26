@@ -15,7 +15,7 @@ It is designed to use the SQL connection to the backends as the sole control cha
 ---
 
 ## Planned features (will add a checklist with completion indicators soon).
-_We're probably too ambitious and suck too much, but it's going to be a lot of work anyway so might as well go the extra mile..._
+_We're probably too ambitious, but it's going to be a lot of work anyway so might as well go the extra mile..._
 
 
 ### Attainable with a vanilla PostgreSQL installation and no superuser access (as of 9.6)
@@ -32,16 +32,16 @@ _We're probably too ambitious and suck too much, but it's going to be a lot of w
 
 * #### Traditional connection pooling
  * This is just a special case whereby a given pool lease last until client disconnection
- 
+
+
 * #### Overlay pgplex-specific connection options to the standard Postgresql connection string..
  *  This allows a client to control the behavior of listener/multiplexer for a given session
 
 * #### Shebang-like strings for command/transaction specific behavior control
- * A specific comment format ```--!pgplex <arguments>``` allows a client to control the behavior of the service after a session has been established
+ * A specific comment format ```--!pgplex <command> <arguments>``` allows a client to control the behavior of the service after a session has been established. This would theoretically also allow for database switching without disconnecting, but we're treading on dangerous ground here as presumably most client drivers live by the assumption that the backend does not allow for it and cache database-specific state locally (in some case non-standard types OIDs and the like, which is particularily scary). Also, this must be forbidden for connections that are in transaction/have open cursors/whatnot
 
-* #### Management database to monitor state
+* #### Management pseudo-database to monitor state/action changes
  * Much like modern unix-like systems expose the likes of /proc and /sys for a consisten abstrction model of their configuration, pgplex uses a reserved database name to abstract configuration/management. Since there is no actual PostgreSQL parser running there, the only supported commands are the aforementioned shebang notation and SET/RESET/SHOW
-
 
 * #### Connections count/state aware load balancing
  * Since pgplex constantly monitors all configured backends through a dedicated connection, it is acutely aware of session count/state through constant monitoring of pg_stat_activity too. It can therefore make load-balancing decisions based on that information
