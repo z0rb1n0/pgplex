@@ -325,9 +325,6 @@ class PGBytea(PGType, bytes):
 	"""
 	def unpack(cls, buffer_data): return buffer_data
 	def pack(self):	return self
-	
-
-
 
 
 ################################################################
